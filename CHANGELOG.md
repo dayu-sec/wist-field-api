@@ -1,7 +1,19 @@
 # CHANGELOG
 
-## 未发布
+## 0.6.5 · 2026-11-09
 
+- **证据读接口的路径 key 改成「调查命令 id 优先」**：`GET /api/evidence/{cmd_id}`、
+  `POST /api/evidence/{cmd_id}:presign`、`GET /api/evidence/{cmd_id}/content`。
+  发起调查的人手里只有 `cmd_id`（证据 id 是不透明的、也不该由人转抄）；
+  列表行里的 `artifact_id` 仍然可用 —— 定位规则在证据服务，BFF 只做路径安全校验与透传。
+  路径参数名从 `artifact_id` 改成 `cmd_id`，URL 形状与鉴权不变。
+- **列表支持 `?cmd_id=` 筛选**：`GET /api/evidence?cmd_id=cmd-...` 原样透传给证据服务，
+  给页面的主筛选位用（命令 id 是发起调查的人手里唯一的关联键）。
+- **新增 `GET /api/evidence/openapi.json`**：证据读接口的 OpenAPI 3.1 自述（列表 / 详情 /
+  能力自述 / 正文代理读 / 预签名）。浏览器能调的就是这些 `/api/evidence*`，证据服务的
+  `/internal/*` 不进去 —— 所以清单由 BFF 出，「接口可用性」页拿它渲染接口列表，
+  页面不再需要另存一份（与 atlas 的 `/api/openapi.json` 同一个用法）。
+- 端点与其它 `/api/*` 同一道门：要操作员身份（`401` 与业务接口一致）。
 - **BFF 去读 atlas 时带令牌**：`field-api.toml` 的 `[atlas]` 新增 `auth_token`（通常是
   `${SEC_ATLAS_API_TOKEN}`）。atlas 从 0.3.4 起读接口要 `Authorization: Bearer`；
   浏览器仍然只持 BFF 的 `wcr_…` 令牌，atlas 的令牌只在本进程里。

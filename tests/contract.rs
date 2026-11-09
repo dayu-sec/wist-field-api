@@ -268,6 +268,21 @@ async fn list_is_passed_through_and_tenant_is_stripped() {
 }
 
 #[tokio::test]
+async fn list_filter_by_command_id_is_passed_through() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config(base, AuthMode::Ingress)));
+    let request = Request::builder()
+        .uri("/api/evidence?cmd_id=cmd-filter-1")
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 命令 id 是页面上的主筛选位：BFF 必须原样透传给证据服务。
+    assert_eq!(body["seen_query"], "cmd_id=cmd-filter-1");
+}
+
+#[tokio::test]
 async fn missing_operator_header_is_401() {
     let base = spawn_stub().await;
     let app = api::router(state(config(base, AuthMode::Ingress)));
@@ -308,6 +323,86 @@ async fn presign_is_passed_through() {
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["artifact_id"], "art_01ABC");
     assert_eq!(body["expires_in_seconds"], 60);
+}
+
+#[tokio::test]
+async fn a_command_id_is_passed_through_as_the_read_key() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config(base, AuthMode::Ingress)));
+    let command_id = "cmd_agent-001_investigate_45";
+
+    // 发起调查的人手里只有命令 id：BFF 不能把它当成非法证据 id 排掉。
+    let request = Request::builder()
+        .uri(format!("/api/evidence/{command_id}"))
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["artifact_id"], command_id);
+
+    // 签名 / 正文走同一条定位规则（`{cmd_id}:presign` 由路由整体吃下来）。
+    let request = Request::builder()
+        .method("POST")
+        .uri(format!("/api/evidence/{command_id}:presign"))
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["artifact_id"], command_id);
+}
+
+#[tokio::test]
+async fn evidence_openapi_describes_the_browser_facing_read_surface() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config(base, AuthMode::Ingress)));
+
+    // 和别的 `/api/*` 一样只有一道门：没有令牌就不给清单。
+    let request = Request::builder()
+        .uri("/api/evidence/openapi.json")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
+
+    let request = Request::builder()
+        .uri("/api/evidence/openapi.json")
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["openapi"], "3.1.0");
+    assert_eq!(body["info"]["title"], "数据场 · 证据读取 API");
+
+    // 清单里必须是浏览器**真能调**的路径（证据服务 `/internal/*` 不能出现在这里）。
+    for path in [
+        "/api/evidence",
+        "/api/evidence/capabilities",
+        "/api/evidence/{cmd_id}",
+        "/api/evidence/{cmd_id}:presign",
+        "/api/evidence/{cmd_id}/content",
+    ] {
+        assert!(body["paths"].get(path).is_some(), "missing {path}: {body}");
+    }
+    // 详情读的路径参数是**调查命令 id**：发起调查的人手里只有它（证据 id 只做兼容）。
+    assert_eq!(
+        body["paths"]["/api/evidence/{cmd_id}"]["get"]["parameters"][0]["name"],
+        "cmd_id"
+    );
+    // 列表页也是 cmd_id 主位：第一个查询参数就是它。
+    assert_eq!(
+        body["paths"]["/api/evidence"]["get"]["parameters"][0]["name"],
+        "cmd_id"
+    );
+    assert_eq!(
+        body["paths"]["/api/evidence/{cmd_id}:presign"]["post"]["responses"]["200"]["content"]["application/json"]
+            ["schema"]["$ref"],
+        "#/components/schemas/PresignResult"
+    );
+    // 文档级鉴权：页面据此给每个接口打「需要令牌」。
+    assert_eq!(body["security"][0]["bearerAuth"], json!([]));
 }
 
 #[tokio::test]

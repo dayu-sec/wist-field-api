@@ -33,8 +33,11 @@ pub fn router(state: AppState) -> Router {
         .route("/api/health", get(health))
         .route("/api/evidence", get(list_evidence))
         // 能力自述：页面据此选「打开正文」的通路（签名 URL / BFF 代理读）。
-        // 静态段优先于下面的 `/api/evidence/{artifact_id}`，不会把 artifact id 吃掉。
+        // 静态段优先于下面的 `/api/evidence/{cmd_id}`，不会把 id 吃掉。
         .route("/api/evidence/capabilities", get(evidence_capabilities))
+        // 接口清单：证据读接口的对外面就是本服务（浏览器到不了证据服务的 `/internal/*`），
+        // 所以由 BFF 出 spec，页面拿它渲染「接口可用性」页，不维护第二份。
+        .route("/api/evidence/openapi.json", get(evidence_openapi))
         .route("/api/integration", get(integration))
         // 运行指标：读计算区自己那份 VictoriaMetrics（数据面镜像写进来的）。
         // 概览 + 单台 agent 的趋势；两个都只读，不做跨栈聚合。
@@ -48,14 +51,11 @@ pub fn router(state: AppState) -> Router {
         // 只放 GET：atlas 的写端点是同一监听的 `/internal/atlas`（POST），浏览器不该碰得到。
         .route("/api/atlas/{*rest}", get(proxy_atlas))
         .route(
-            "/api/evidence/{artifact_id}",
+            "/api/evidence/{cmd_id}",
             get(get_evidence).post(presign_evidence),
         )
         // 代理读正文：预签名不可用的部署（证据服务 objects.kind = file）走这条。
-        .route(
-            "/api/evidence/{artifact_id}/content",
-            get(get_evidence_content),
-        )
+        .route("/api/evidence/{cmd_id}/content", get(get_evidence_content))
         .with_state(state.clone());
 
     // 登录端点：把一条访问令牌换成「你是谁 + 给了什么角色」。
@@ -305,6 +305,17 @@ async fn evidence_capabilities(State(state): State<AppState>, headers: HeaderMap
     .into_response()
 }
 
+/// `GET /api/evidence/openapi.json`：证据读接口的 OpenAPI 自述。
+///
+/// 与 `/api/health` 一样只要操作员身份：spec 本身不含数据，但它是浏览器能看到的
+/// 接口清单，没必要在未登录时暴露。
+async fn evidence_openapi(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    if let Err(err) = require_operator(&state, &headers) {
+        return err.into_response();
+    }
+    Json(crate::openapi::evidence()).into_response()
+}
+
 /// 从证据服务 `/healthz` 正文里取 `objects.kind`；形状不认识就当不知道（`None`）。
 fn evidence_objects_kind(body: &[u8]) -> Option<String> {
     let value: serde_json::Value = serde_json::from_slice(body).ok()?;
@@ -332,42 +343,47 @@ async fn list_evidence(
     }
 }
 
+/// `GET /api/evidence/{cmd_id}`：读一条证据的索引行。
+///
+/// 路径里的 key 可以是**调查命令 id**（`cmd_id`，发起调查的人手里只有这个），
+/// 也可以是列表行里的证据 id（`art_…`）—— 证据服务按先后顺序自己找。
+/// BFF 只做路径安全校验与透传，不替调用方判哪个是哪种 id。
 async fn get_evidence(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(artifact_id): Path<String>,
+    Path(key): Path<String>,
 ) -> Response {
     if let Err(err) = require_operator(&state, &headers) {
         return err.into_response();
     }
-    let Some(artifact_id) = valid_artifact_id(&artifact_id) else {
+    let Some(key) = valid_evidence_key(&key) else {
         return not_found();
     };
-    match state.evidence.get(artifact_id).await {
+    match state.evidence.get(key).await {
         Ok(response) => passthrough(response),
         Err(err) => upstream_failed(err),
     }
 }
 
-/// `POST /api/evidence/{artifact_id}:presign`。
+/// `POST /api/evidence/{cmd_id}:presign`（key 也接受证据 id）。
 ///
-/// 与证据服务同一条路由技巧：`{artifact_id}` 会把 `art_x:presign` 整段吃下来。
-/// `GET /api/evidence/{artifact_id}/content`：原文代理读。
+/// 与证据服务同一条路由技巧：`{cmd_id}` 会把 `art_x:presign` 整段吃下来。
+/// `GET /api/evidence/{cmd_id}/content`：原文代理读。
 ///
 /// 本地文件存储（`objects.kind = file`）不签发预签名 URL，页面就用这条拿正文：
 /// BFF 带自己的身份去证据服务取原文，浏览器始终不碰任何凭据。
 async fn get_evidence_content(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Path(artifact_id): Path<String>,
+    Path(key): Path<String>,
 ) -> Response {
     if let Err(err) = require_operator(&state, &headers) {
         return err.into_response();
     }
-    let Some(artifact_id) = valid_artifact_id(&artifact_id) else {
+    let Some(key) = valid_evidence_key(&key) else {
         return not_found();
     };
-    match state.evidence.content(artifact_id).await {
+    match state.evidence.content(key).await {
         Ok(response) => passthrough_uncached(response),
         Err(err) => upstream_failed(err),
     }
@@ -453,13 +469,13 @@ async fn presign_evidence(
     if let Err(err) = require_operator(&state, &headers) {
         return err.into_response();
     }
-    let Some(artifact_id) = raw.strip_suffix(":presign") else {
+    let Some(key) = raw.strip_suffix(":presign") else {
         return not_found();
     };
-    let Some(artifact_id) = valid_artifact_id(artifact_id) else {
+    let Some(key) = valid_evidence_key(key) else {
         return not_found();
     };
-    match state.evidence.presign(artifact_id).await {
+    match state.evidence.presign(key).await {
         Ok(response) => passthrough(response),
         Err(err) => upstream_failed(err),
     }
@@ -577,7 +593,11 @@ impl OperatorError {
     }
 }
 
-fn valid_artifact_id(raw: &str) -> Option<&str> {
+/// 路径里的证据 key（证据 id 或调查命令 id）只做**路径安全**校验。
+///
+/// 不在这里判断它是 `art_…` 还是 `cmd_…`：那是证据服务的定位规则，
+/// BFF 只负责不让 `/`、`..` 之类的段穿过去。
+fn valid_evidence_key(raw: &str) -> Option<&str> {
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.contains('/') || trimmed.contains("..") {
         return None;

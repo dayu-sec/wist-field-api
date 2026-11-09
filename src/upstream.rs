@@ -74,26 +74,21 @@ impl EvidenceClient {
         self.send(Method::GET, "/healthz").await
     }
 
-    pub async fn get(&self, artifact_id: &str) -> Result<UpstreamResponse, String> {
-        self.send(Method::GET, &format!("/internal/evidence/{artifact_id}"))
+    pub async fn get(&self, key: &str) -> Result<UpstreamResponse, String> {
+        self.send(Method::GET, &format!("/internal/evidence/{key}"))
             .await
     }
 
-    pub async fn presign(&self, artifact_id: &str) -> Result<UpstreamResponse, String> {
-        self.send(
-            Method::POST,
-            &format!("/internal/evidence/{artifact_id}:presign"),
-        )
-        .await
+    /// 短签名。`key` 可以是证据 id 或调查命令 id（定位规则在证据服务）。
+    pub async fn presign(&self, key: &str) -> Result<UpstreamResponse, String> {
+        self.send(Method::POST, &format!("/internal/evidence/{key}:presign"))
+            .await
     }
 
-    /// 代理读正文（`GET /internal/evidence/{id}/content`）。
+    /// 代理读正文（`GET /internal/evidence/{key}/content`）。
     /// 预签名不可用的部署（证据服务 `objects.kind = file`）走这条。
-    pub async fn content(&self, artifact_id: &str) -> Result<UpstreamResponse, String> {
-        self.send(
-            Method::GET,
-            &format!("/internal/evidence/{artifact_id}/content"),
-        )
-        .await
+    pub async fn content(&self, key: &str) -> Result<UpstreamResponse, String> {
+        self.send(Method::GET, &format!("/internal/evidence/{key}/content"))
+            .await
     }
 }

@@ -21,8 +21,9 @@ GET  /api/health
      → { status, sources: { evidence|atlas|metrics|devices: { status, detail? } },
          interfaces: [{ id, label, covers, url?, status, detail?, latency_ms?, checked_at_ms? }] }
 
-GET  /api/evidence?kind=&subject_id=&since=&limit=&cursor=
+GET  /api/evidence?cmd_id=&kind=&subject_id=&since=&limit=&cursor=
      → 透传证据服务的 { artifacts, next_cursor }
+       `cmd_id` 是主筛选位：发起调查时拿到的命令 id，只看这次调查的产物。
 
 GET  /api/evidence/capabilities
      → { objects_kind: "file"|"s3"|null, presign_supported: bool }
@@ -30,13 +31,20 @@ GET  /api/evidence/capabilities
        `presign_supported = false`（本地文件存储）时页面直接走代理读，
        不再先发一个必然 501 的签名请求；后端不报时退回「先试签名、失败再回落」。
 
-GET  /api/evidence/{artifact_id}
-     → 透传证据服务的索引行
+GET  /api/evidence/openapi.json
+     → OpenAPI 3.1：浏览器能调的证据读接口（列表 / 详情 / 能力自述 / 正文代理读 / 预签名）。
+       证据服务的 `/internal/*` 不进 spec —— 浏览器到不了，身份由 BFF 从配置里带。
+       「接口可用性」页拿它渲染接口列表（与 atlas 的 `/api/openapi.json` 同一个用法）。
 
-GET  /api/evidence/{artifact_id}/content
+GET  /api/evidence/{cmd_id}
+     → 透传证据服务的索引行
+       path 里的 key 是**调查命令 id**（发起调查的人手里只有这个）；
+       列表行里的证据 id（`art_…`）也接受 —— 证据服务先按证据 id 再按命令 id 找。
+
+GET  /api/evidence/{cmd_id}/content
      → 代理读正文（本地文件模式没有预签名时走这条）
 
-POST /api/evidence/{artifact_id}:presign
+POST /api/evidence/{cmd_id}:presign
      → 透传证据服务的 { artifact_id, url, expires_in_seconds, expires_at }
 
 GET  /api/integration
