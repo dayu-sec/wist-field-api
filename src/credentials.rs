@@ -289,7 +289,11 @@ pub fn build(config: &CredentialsConfig) -> Result<CredentialRuntime, String> {
     let key = identity.key.clone();
     let client_ca = identity.client_ca.clone();
 
-    if cred.verify.audience.trim().is_empty() {
+    // audience 支持 `${…}`：认证系统名是**部署事实**（cred 侧那个 peer 叫什么，这里就得叫什么），
+    // 不同站点/认证系统不一样，而现场不该为一个名字去改这份文件。
+    // 占位符解不开 → 启动期就报，不静默拿占位符当名字（那会让 cred 的推送永远 400）。
+    let audience = crate::config::expand_secret(&cred.verify.audience)?;
+    if audience.trim().is_empty() {
         return Err(format!(
             "{}: [verify].audience is missing (re-run the join command)",
             file.display()
@@ -402,7 +406,7 @@ pub fn build(config: &CredentialsConfig) -> Result<CredentialRuntime, String> {
         None => String::new(),
     };
 
-    let mut peer_config = PeerConfig::new(cred.verify.audience.clone(), &config.store_path)
+    let mut peer_config = PeerConfig::new(audience, &config.store_path)
         .known_roles(cred.verify.roles.iter().cloned())
         .require_signature(require_signature)
         // 自注册要靠它推导状态（材料齐不齐）与上报地址。
@@ -620,6 +624,19 @@ mod tests {
         };
         let error = build(&config).expect_err("missing file must fail");
         assert!(error.contains("/nonexistent/cred.toml"), "{error}");
+    }
+
+    #[test]
+    fn audience_placeholder_is_expanded_or_reported() {
+        let dir = temp_dir("audience");
+        let body = format!(
+            "[verify]\naudience = \"${{FIELD_API_AUDIENCE}}\"\nallowed_issuers = [\"wist-cred\"]\nroles = [\"read\"]\n{INIT_AND_PUBLISH}"
+        );
+        // 环境里没有这个变量时：必须报“解不开”，而不是拿占位符当 audience 继续跑
+        // （那种情况 cred 侧只会得到 400 audience_mismatch，错在对端、极难查）。
+        let error = build_from(&dir, &body).expect_err("unresolved audience must fail");
+        assert!(error.contains("unresolved environment variable"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ── 自注册：两种 cred.toml 形态 ──
