@@ -1,5 +1,15 @@
 # CHANGELOG
 
+## 0.6.6 · 2026-11-09
+
+- **`[verify].audience` 支持 `${…}` 展开**（与 `[init]` / `[publish]` 的字段同一机制）。
+  audience 是**部署事实**：它必须等于 cred 侧那个 peer / 认证系统的名字，而不同站点往往
+  用不同名字（例如 `local-field-alpha`）。以前只能改 `cred.toml` 本身，现在栈可以用
+  `FIELD_API_AUDIENCE` 之类的变量渲染，站点在 `values/<系统>/sys_value.yml` 里设一次就行。
+- 占位符解不开时启动期就报 `unresolved environment variable(s) in "…"`，不会拿占位符
+  当 audience 继续跑 —— 那种情况 cred 侧只会得到 400 `audience_mismatch`，错在对端、极难查。
+- 行为不变：不含 `${}` 的字面量原样使用（老配置零改动）。
+
 ## 0.6.5 · 2026-11-09
 
 - **证据读接口的路径 key 改成「调查命令 id 优先」**：`GET /api/evidence/{cmd_id}`、
