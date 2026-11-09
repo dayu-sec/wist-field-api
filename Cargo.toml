@@ -27,7 +27,7 @@ wist-cred-peer = "0.5"
 wist-auth = { version = "0.3", features = ["credential"] }
 # 运行指标页读的是 agent 自观测指标：名字 / label 键 / 单位换算只从这张常量表取。
 # 读侧手写名字曾经让整页静默空白（见该 crate 的 names 模块说明）。
-wist-metrics = "0.13"
+wist-metrics = "0.14"
 # 凭据 listener 的 mTLS 握手（与 wist-cred-peer / wist-gwlinkd 同一份实现）。
 wist-pki = "0.1.2"
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
