@@ -18,6 +18,15 @@ use crate::config::{AuthMode, Config};
 use crate::metrics;
 use crate::upstream::{EvidenceClient, UpstreamResponse};
 
+/// 数据面的 wparse 通过哪个环境变量拿到本栈 VM 的写入地址。
+///
+/// 与网关栈（写控制面那份 VM）用的是同一个变量名 —— 同一个业务分组镜像到两份存储时，
+/// 只改环境变量的值，不改配置。写在这里是因为它**是协议事实、不是部署事实**：
+/// 页面不该再手写一遍，否则名字一改就两边对不上。
+const METRICS_ENDPOINT_ENV: &str = "CONSOLE_VM_ENDPOINT";
+/// VM 的 JSON line 导入路径（`agent_metrics` 分组用的就是这条）。
+const METRICS_IMPORT_PATH: &str = "/api/v1/import";
+
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
@@ -240,6 +249,23 @@ async fn integration(State(state): State<AppState>, headers: HeaderMap) -> Respo
         env.insert("ATLAS_SINK_URL".to_string(), json!(atlas_base));
     }
 
+    // 运行指标：**数据面视角**的写入端点 + 协议事实（变量名 / 导入路径）。
+    //
+    // 这三样必须由配置 + 一处常量坐实：它们出现在页面的可复制样板里，
+    // 一旦有人手写一遍，地址或变量名就会与真实部署漂开 ——
+    // 而漂开的后果是「接完了但没数据」，最难查。
+    let metrics = state.config.metrics.as_ref().and_then(|metrics| {
+        let write_url = metrics.write_url.as_ref()?.trim_end_matches('/').to_string();
+        env.insert(METRICS_ENDPOINT_ENV.to_string(), json!(write_url));
+        Some(json!({
+            "write_url": write_url,
+            "import_path": METRICS_IMPORT_PATH,
+            "env": METRICS_ENDPOINT_ENV,
+            // BFF 视角的查询入口（栈内）；页面只用它做探活归属说明。
+            "base_url": metrics.base_url,
+        }))
+    });
+
     let atlas = atlas_base.map(|base| {
         json!({
             "write_url": format!("{base}/internal/atlas"),
@@ -270,6 +296,9 @@ async fn integration(State(state): State<AppState>, headers: HeaderMap) -> Respo
         },
         // 资产拓扑写端点：只有两个字段（证据服务的 `cmd_id` 是它自己的幂等键）。
         "atlas": atlas,
+        // 运行指标写端点：同样是**数据面视角**。
+        // 没配 `[metrics] write_url` 时为 null —— 不编造占位地址。
+        "metrics": metrics,
         // 接入样板里的 sink 分组由页面现场拼（复用现成的 `http_sink`），
         // BFF 只回数据面要用的环境变量 —— 不再下发 `[[connectors]]` 定义。
         "warp_parse": {

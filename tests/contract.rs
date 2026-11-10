@@ -458,6 +458,7 @@ async fn interfaces_are_probed_when_configured() {
     cfg.integration.sink_health_url = Some(format!("{base}/healthz"));
     cfg.metrics = Some(MetricsConfig {
         base_url: base.clone(),
+        write_url: None,
     });
     let app = api::router(state(cfg));
     let request = Request::builder()
@@ -509,6 +510,57 @@ async fn integration_page_shows_the_sink_contract() {
         body["warp_parse"]["env"]["EVIDENCE_SINK_URL"],
         "http://10.0.0.5:18800"
     );
+}
+
+#[tokio::test]
+async fn integration_page_shows_the_metrics_endpoint_from_config() {
+    // 运行指标的接入样板不能再手写地址：写端点来自 `[metrics] write_url`，
+    // 变量名与导入路径来自 BFF 的一处常量。
+    let base = spawn_stub().await;
+    let mut cfg = config(base, AuthMode::Ingress);
+    cfg.metrics = Some(MetricsConfig {
+        base_url: "http://metrics:8428".to_string(),
+        write_url: Some("http://10.0.0.5:18428/".to_string()),
+    });
+    let app = api::router(state(cfg));
+    let request = Request::builder()
+        .uri("/api/integration")
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // 尾斜杠被去掉：页面会自己拼 `${ENV}/api/v1/import`。
+    assert_eq!(body["metrics"]["write_url"], "http://10.0.0.5:18428");
+    assert_eq!(body["metrics"]["import_path"], "/api/v1/import");
+    assert_eq!(body["metrics"]["env"], "CONSOLE_VM_ENDPOINT");
+    // 数据面进程要看到的环境变量同步下发。
+    assert_eq!(
+        body["warp_parse"]["env"]["CONSOLE_VM_ENDPOINT"],
+        "http://10.0.0.5:18428"
+    );
+}
+
+#[tokio::test]
+async fn metrics_block_is_null_when_no_dataplane_address_is_configured() {
+    // 没配就**不展示写入样板**，而不是编一个占位地址 ——
+    // 占位地址被 copy 出去就是「接完了但没数据」。
+    let base = spawn_stub().await;
+    let mut cfg = config(base.clone(), AuthMode::Ingress);
+    cfg.metrics = Some(MetricsConfig {
+        base_url: base,
+        write_url: None,
+    });
+    let app = api::router(state(cfg));
+    let request = Request::builder()
+        .uri("/api/integration")
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert!(body["metrics"].is_null());
+    assert!(body["warp_parse"]["env"]["CONSOLE_VM_ENDPOINT"].is_null());
 }
 
 #[tokio::test]
@@ -1020,6 +1072,7 @@ async fn metrics_page_reads_the_compute_zone_victoria_metrics() {
     let mut cfg = config(base.clone(), AuthMode::Ingress);
     cfg.metrics = Some(MetricsConfig {
         base_url: base.clone(),
+        write_url: None,
     });
     let app = api::router(state(cfg));
 
@@ -1062,6 +1115,7 @@ async fn metrics_history_is_normalized_per_agent() {
     let mut cfg = config(base.clone(), AuthMode::Ingress);
     cfg.metrics = Some(MetricsConfig {
         base_url: base.clone(),
+        write_url: None,
     });
     let app = api::router(state(cfg));
 

@@ -118,7 +118,13 @@ pub struct AtlasConfig {
 /// VictoriaMetrics（或任何兼容的 Prometheus 查询 API）。
 #[derive(Debug, Clone)]
 pub struct MetricsConfig {
+    /// BFF 视角的查询入口（栈内地址，用于探活与指标页）。
     pub base_url: String,
+    /// **数据面视角**的写入端点（`http://<内网地址>:<宿主端口>`）。
+    ///
+    /// 与 `atlas.sink_url` 同一个意思：给数据面看 / copy 的地址，BFF 自己不去写。
+    /// 没配就不展示写入样板 —— 不编造一个假地址，那正是这份配置存在的理由。
+    pub write_url: Option<String>,
 }
 
 impl Config {
@@ -347,6 +353,8 @@ struct RawAtlas {
 #[derive(Debug, Deserialize)]
 struct RawMetrics {
     base_url: String,
+    #[serde(default)]
+    write_url: String,
 }
 
 impl RawConfig {
@@ -440,6 +448,11 @@ impl RawConfig {
             metrics: match self.metrics {
                 Some(metrics) if !metrics.base_url.trim().is_empty() => Some(MetricsConfig {
                     base_url: expand(env, &metrics.base_url)?,
+                    write_url: if metrics.write_url.trim().is_empty() {
+                        None
+                    } else {
+                        Some(expand(env, &metrics.write_url)?)
+                    },
                 }),
                 _ => None,
             },

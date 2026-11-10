@@ -44,7 +44,11 @@ timeout_secs = 10
 # 运行指标：读的是**本栈** VictoriaMetrics（数据面 wparse 把 agent 采集指标镜像进来）。
 # 没配 = 「运行指标」页回 503 `metrics_not_configured`（那是「没接入」，不是故障）。
 # [metrics]
+# BFF 视角（栈内）的查询入口：探活与指标页用。
 # base_url = "http://127.0.0.1:18428"
+# 数据面视角的写入端点：只用于「接入」页展示 / copy，BFF 自己不去写。
+# 不配就不展示运行指标的写入样板（不编造占位地址）。
+# write_url = "http://${METRICS_WRITE_HOST}:${VM_HOST_PORT}"
 
 # 业务层：把「主机集合」归到一个命名的逻辑单元（用来算投入产出比）。
 #
