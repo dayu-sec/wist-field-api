@@ -255,7 +255,11 @@ async fn integration(State(state): State<AppState>, headers: HeaderMap) -> Respo
     // 一旦有人手写一遍，地址或变量名就会与真实部署漂开 ——
     // 而漂开的后果是「接完了但没数据」，最难查。
     let metrics = state.config.metrics.as_ref().and_then(|metrics| {
-        let write_url = metrics.write_url.as_ref()?.trim_end_matches('/').to_string();
+        let write_url = metrics
+            .write_url
+            .as_ref()?
+            .trim_end_matches('/')
+            .to_string();
         env.insert(METRICS_ENDPOINT_ENV.to_string(), json!(write_url));
         Some(json!({
             "write_url": write_url,
