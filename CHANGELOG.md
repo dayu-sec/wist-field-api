@@ -1,5 +1,16 @@
 # CHANGELOG
 
+## 0.6.7 · 2026-11-11
+
+- **`[metrics]` 新增 `write_url`（数据面视角的写入端点）**：与 `[atlas] sink_url` 同一性质 ——
+  BFF 自己不用它，只透给「数据面接入」页 copy。`base_url` 保持 BFF 视角（栈内查询入口）不变。
+- **`/api/integration` 新增 `metrics` 块**：
+  `{ write_url, import_path, env, base_url }`，并把 `CONSOLE_VM_ENDPOINT` 一并放进
+  `warp_parse.env`。变量名与导入路径是**协议事实**，收在 `api.rs` 两个常量里，
+  页面不再手写 —— 原来页面写的是 `WIST_METRICS_ENDPOINT`，而数据面真正读的是
+  `CONSOLE_VM_ENDPOINT`，两边对不上只会得到「接完了但没数据」。
+- 没配 `write_url` 时回 `metrics: null`，**不编造占位地址**。
+
 ## 0.6.6 · 2026-11-09
 
 - **`[verify].audience` 支持 `${…}` 展开**（与 `[init]` / `[publish]` 的字段同一机制）。
