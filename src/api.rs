@@ -15,6 +15,7 @@ use axum::routing::get;
 use serde_json::json;
 
 use crate::config::{AuthMode, Config};
+use crate::credentials::Principal;
 use crate::metrics;
 use crate::upstream::{EvidenceClient, UpstreamResponse};
 
@@ -48,6 +49,9 @@ pub fn router(state: AppState) -> Router {
         // 所以由 BFF 出 spec，页面拿它渲染「接口可用性」页，不维护第二份。
         .route("/api/evidence/openapi.json", get(evidence_openapi))
         .route("/api/integration", get(integration))
+        // 会话：这次能看哪些客户。前端用它决定“要不要显示客户选择器”。
+        // **不返回默认客户**：不在前端猜一个默认值（那类退化是看错客户的来源）。
+        .route("/api/session", get(session))
         // 运行指标：读计算区自己那份 VictoriaMetrics（数据面镜像写进来的）。
         // 概览 + 单台 agent 的趋势；两个都只读，不做跨栈聚合。
         .route("/api/metrics", get(metrics::overview))
@@ -223,10 +227,36 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
 /// 展示给运维的「数据面接入」：写端点 + 可直接 copy 的 wparse 配置。
 ///
 /// **不回传站点 token**，只回占位符。
-async fn integration(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Err(err) = require_operator(&state, &headers) {
-        return err.into_response();
-    }
+/// `GET /api/session`：把调用方能选的客户如实告诉前端。
+///
+/// 不返回“默认客户”——单客户站点前端不需要选择器（`tenants` 为空或只有一项），
+/// 多客户站点必须由用户显式选（不带 `?tenant=` 一律 400）。
+async fn session(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    Json(json!({
+        "subject": principal.subject,
+        "roles": principal.roles,
+        "tenants": principal.tenants,
+    }))
+    .into_response()
+}
+
+async fn integration(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, query.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
     let sink_base = state
         .config
         .integration
@@ -290,10 +320,10 @@ async fn integration(State(state): State<AppState>, headers: HeaderMap) -> Respo
             "write_url": write_url,
             "auth": "none",
             // `tenant` 就是客户 id：租户与客户已经合并成一个维度。
-            "customer": state.config.evidence.tenant,
+            "customer": tenant,
             "allowed_kinds": state.config.integration.allowed_kinds,
             "record": {
-                "cust_id": state.config.evidence.tenant,
+                "cust_id": tenant,
                 "cmd_id": "cmd-20261105-001",
                 "content": { "summary": { "overall": "warn" }, "findings": [] },
             },
@@ -364,13 +394,17 @@ async fn list_evidence(
     headers: HeaderMap,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if let Err(err) = require_operator(&state, &headers) {
-        return err.into_response();
-    }
-    let query = query
-        .map(|raw| strip_tenant(&raw))
-        .filter(|raw| !raw.is_empty());
-    match state.evidence.list(query.as_deref()).await {
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let (requested, rest) = split_tenant(query.as_deref().unwrap_or(""));
+    let tenant = match resolve_tenant(&state, &principal, requested.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
+    let query = Some(rest).filter(|raw| !raw.is_empty());
+    match state.evidence.list(&tenant, query.as_deref()).await {
         Ok(response) => passthrough(response),
         Err(err) => upstream_failed(err),
     }
@@ -385,14 +419,20 @@ async fn get_evidence(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(key): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    if let Err(err) = require_operator(&state, &headers) {
-        return err.into_response();
-    }
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, query.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
     let Some(key) = valid_evidence_key(&key) else {
         return not_found();
     };
-    match state.evidence.get(key).await {
+    match state.evidence.get(&tenant, key).await {
         Ok(response) => passthrough(response),
         Err(err) => upstream_failed(err),
     }
@@ -409,14 +449,20 @@ async fn get_evidence_content(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(key): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    if let Err(err) = require_operator(&state, &headers) {
-        return err.into_response();
-    }
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, query.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
     let Some(key) = valid_evidence_key(&key) else {
         return not_found();
     };
-    match state.evidence.content(key).await {
+    match state.evidence.content(&tenant, key).await {
         Ok(response) => passthrough_uncached(response),
         Err(err) => upstream_failed(err),
     }
@@ -455,6 +501,12 @@ async fn proxy_atlas(
 
     // atlas 的读接口都在 `/api/*` 下（写端点是 `/internal/atlas`）。
     // 前端看到的是 `/atlas/api/hosts`，到这里剩下 `hosts`，补回 `/api` 才是 atlas 的路径。
+    //
+    // ⚠️ **多客户未隔离（已知缺口，M2 之后处理）**：atlas 的租户是独立的 UUID，
+    // 与证据的 `cust_id` 不同源，且它的读接口目前不按租户过滤 —— 所以这条代理
+    // **不注入客户**。多客户站点若启用资产拓扑，必须单独给 atlas 做租户对齐，
+    // 否则任何持令牌的人都能看到全部客户的拓扑（`tests/contract.rs` 里有一条
+    // 锁定当前行为的用例，避免它被误认为已隔离）。
     let mut url = format!("{}/api/{rest}", atlas.base_url.trim_end_matches('/'));
     if let Some(query) = query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
         url.push('?');
@@ -498,17 +550,23 @@ async fn presign_evidence(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(raw): Path<String>,
+    RawQuery(query): RawQuery,
 ) -> Response {
-    if let Err(err) = require_operator(&state, &headers) {
-        return err.into_response();
-    }
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, query.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
     let Some(key) = raw.strip_suffix(":presign") else {
         return not_found();
     };
     let Some(key) = valid_evidence_key(key) else {
         return not_found();
     };
-    match state.evidence.presign(key).await {
+    match state.evidence.presign(&tenant, key).await {
         Ok(response) => passthrough(response),
         Err(err) => upstream_failed(err),
     }
@@ -524,6 +582,14 @@ fn require_operator(
     state: &AppState,
     headers: &HeaderMap,
 ) -> Result<Option<String>, OperatorError> {
+    require_principal(state, headers).map(|principal| Some(principal.subject))
+}
+
+/// 真正的校验：返回调用方主体（subject / roles / 可选客户集合）。
+///
+/// `tenants` 来自**配置**（`evidence.allowed_tenants`）—— 本期与凭据无关；
+/// M2 把这一行换成读凭据的 `resources.tenants` 即可，其它调用点不变。
+fn require_principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, OperatorError> {
     match state.config.auth.mode {
         AuthMode::Ingress => {
             let name = &state.config.auth.operator_header;
@@ -533,7 +599,11 @@ fn require_operator(
                 .map(str::trim)
                 .filter(|value| !value.is_empty());
             match value {
-                Some(operator) => Ok(Some(operator.to_string())),
+                Some(operator) => Ok(Principal {
+                    subject: operator.to_string(),
+                    roles: Vec::new(),
+                    tenants: state.config.evidence.allowed_tenants.clone(),
+                }),
                 None => Err(OperatorError::MissingHeader(name.clone())),
             }
         }
@@ -547,7 +617,12 @@ fn require_operator(
                 return Err(OperatorError::InvalidCredential);
             };
             match verifier.verify(token) {
-                Ok(caller) => Ok(Some(caller.subject)),
+                Ok(caller) => Ok(Principal {
+                    subject: caller.subject,
+                    roles: caller.roles,
+                    // M1.5：可选客户来自配置；M2 换成 `caller.tenants`（凭据的 resources）。
+                    tenants: state.config.evidence.allowed_tenants.clone(),
+                }),
                 Err(crate::credentials::VerifyError::RoleRequired) => {
                     Err(OperatorError::RoleRequired)
                 }
@@ -563,11 +638,12 @@ fn require_operator(
     }
 }
 
-/// 同一道门，给 api 以外的模块（运行指标）用：拒绝时直接给出响应。
-pub(crate) fn authorize(state: &AppState, headers: &HeaderMap) -> Option<Response> {
-    require_operator(state, headers)
-        .err()
-        .map(|err| err.into_response())
+/// 与 `authorize` 同一道门，但把调用方交回来（运行指标要按客户过滤）。
+pub(crate) fn authorize_principal(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Principal, Box<Response>> {
+    require_principal(state, headers).map_err(|err| Box::new(err.into_response()))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<&str> {
@@ -638,13 +714,64 @@ fn valid_evidence_key(raw: &str) -> Option<&str> {
     Some(trimmed)
 }
 
-/// 租户永远来自配置；浏览器带的 `tenant` 参数一律丢掉。
-fn strip_tenant(query: &str) -> String {
-    query
+/// 租户参数从 query 里拆出来：**先拆、再校验**，绝不直接把浏览器传的值转给证据服务。
+///
+/// 返回 `(tenant, 剩余 query)`。
+pub(crate) fn split_tenant(query: &str) -> (Option<String>, String) {
+    let mut tenant = None;
+    let rest = query
         .split('&')
-        .filter(|pair| !pair.is_empty() && !pair.starts_with("tenant="))
+        .filter(|pair| !pair.is_empty())
+        .filter(|pair| {
+            if let Some(value) = pair.strip_prefix("tenant=") {
+                // 取最后一个 `tenant=`（重复参数时行为可预测）
+                tenant = Some(value.to_string());
+                false
+            } else {
+                true
+            }
+        })
         .collect::<Vec<_>>()
-        .join("&")
+        .join("&");
+    (tenant, rest)
+}
+
+/// 选客户失败 → 400 / 403。
+///
+/// `NotAllowed` **不回显该客户是否存在**：只告诉调用方“不在你的可选集合里”。
+pub(crate) fn tenant_error(err: crate::credentials::TenantError) -> Response {
+    use crate::credentials::TenantError;
+    match err {
+        TenantError::Required => error_response(
+            StatusCode::BAD_REQUEST,
+            "tenant_required",
+            "this deployment serves multiple customers: pass `?tenant=<id>`",
+        ),
+        TenantError::NotAllowed => error_response(
+            StatusCode::FORBIDDEN,
+            "tenant_not_allowed",
+            "the requested tenant is not in this caller's tenant set",
+        ),
+    }
+}
+
+/// 从 query 里取 `?tenant=` 并校验（不传 = 按集合大小决策）。
+pub(crate) fn tenant_from_query(
+    state: &AppState,
+    principal: &Principal,
+    query: Option<&str>,
+) -> Result<String, crate::credentials::TenantError> {
+    let (requested, _rest) = split_tenant(query.unwrap_or(""));
+    resolve_tenant(state, principal, requested.as_deref())
+}
+
+/// 定下本次请求的客户：先看显式参数，再按集合大小决策，最后才是配置的兜底租户。
+pub(crate) fn resolve_tenant(
+    state: &AppState,
+    principal: &Principal,
+    requested: Option<&str>,
+) -> Result<String, crate::credentials::TenantError> {
+    principal.resolve_tenant(requested, state.config.evidence.default_tenant.as_deref())
 }
 
 fn passthrough(response: UpstreamResponse) -> Response {
@@ -844,7 +971,15 @@ async fn probe_evidence_read(state: &AppState) -> serde_json::Value {
         state.config.evidence.base_url.trim_end_matches('/')
     );
     let started = std::time::Instant::now();
-    let result = state.evidence.list(Some("limit=1")).await;
+    // 探活用**兜底租户**（单客户站点就是它；多客户站点能验证读链路即可）。
+    let probe_tenant = state
+        .config
+        .evidence
+        .default_tenant
+        .clone()
+        .or_else(|| state.config.evidence.allowed_tenants.first().cloned())
+        .unwrap_or_default();
+    let result = state.evidence.list(&probe_tenant, Some("limit=1")).await;
     let latency_ms = started.elapsed().as_millis() as u64;
     match result {
         Ok(response) if response.status.is_success() => entry(

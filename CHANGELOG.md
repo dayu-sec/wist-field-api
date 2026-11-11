@@ -1,5 +1,24 @@
 # CHANGELOG
 
+## 0.7.0 · 2026-11-11
+
+- **多客户（M1.5）：按客户读证据 + 指标**。一套 BFF 服务多个客户，客户由**服务端**决定，
+  浏览器只能“选”，不能“授”。
+  - `[evidence] tenant` → `default_tenant`（**旧名仍可读**，`serde alias`），
+    并且接上了 `${VAR}` 展开（以前模板只能写字面量）；
+  - 新增 `allowed_tenants`：本栈服务的客户集合（本期来自配置；M2 换成凭据的 `resources.tenants`）；
+  - `?tenant=` 语义：集合内 → 用它；越界 → **403 `tenant_not_allowed`**（不回显客户是否存在）；
+    多客户不带 → **400 `tenant_required`**；单客户站点行为不变；
+  - 四条读路径（list / get / content / presign）**全部**走同一校验；
+  - 新增 `GET /api/session` → `{subject, roles, tenants}`，**不返回默认客户**
+    （前端不许猜默认值，那类退化是看错客户的来源）；
+  - 运行指标的所有 PromQL 统一注入 `tenant_id="<当前客户>"`（多客户的指标存在同一个 VM 里）；
+  - 启动日志打出 `default=… allowed=N` 与“单/多客户”判据，便于现场排障。
+- `/api/integration` 的 `customer` / `cust_id` 改为**当前选中的客户**（不再是配置单值）。
+- 已知缺口（不在本期）：`/api/atlas/*` 仍不按客户过滤（atlas 租户是独立 UUID），
+  代码与测试里都显式标注。
+
+
 ## 0.6.7 · 2026-11-11
 
 - **`[metrics]` 新增 `write_url`（数据面视角的写入端点）**：与 `[atlas] sink_url` 同一性质 ——

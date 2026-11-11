@@ -16,7 +16,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::time::Duration;
 
 use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::{Path, Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -24,7 +24,9 @@ use serde_json::{Value, json};
 use wist_metrics::names::{agent as agent_metric, label, ratio_to_percent, seconds_to_millis};
 use wist_metrics::spec::METRIC_SPECS;
 
-use crate::api::{AppState, authorize, error_response, now_ms};
+use crate::api::{
+    AppState, authorize_principal, error_response, now_ms, tenant_error, tenant_from_query,
+};
 use crate::config::BusinessUnit;
 
 /// 「有没有在跳」的观察窗口（秒）：这段时间里一个样本都没有 = 采集静默。
@@ -165,14 +167,23 @@ pub struct HistoryQuery {
 }
 
 /// `GET /api/metrics` — 概览：存储里有什么、谁在报、当前值是多少。
-pub async fn overview(State(state): State<AppState>, headers: HeaderMap) -> Response {
-    if let Some(response) = authorize(&state, &headers) {
-        return response;
-    }
+pub async fn overview(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(query): RawQuery,
+) -> Response {
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, query.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
     let Some(config) = metrics_config(&state) else {
         return not_configured();
     };
-    match collect_overview(&state.http, &config, &state.config.business).await {
+    match collect_overview(&state.http, &config, &state.config.business, &tenant).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
     }
@@ -184,16 +195,22 @@ pub async fn agent_history(
     headers: HeaderMap,
     Path(agent_id): Path<String>,
     Query(query): Query<HistoryQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
-    if let Some(response) = authorize(&state, &headers) {
-        return response;
-    }
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, raw.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
     let Some(config) = metrics_config(&state) else {
         return not_configured();
     };
 
     let (window, step) = history_window(query.window_seconds, query.step_seconds);
-    match collect_history(&state.http, &config, &agent_id, window, step).await {
+    match collect_history(&state.http, &config, &agent_id, window, step, &tenant).await {
         Ok(history) => Json(history).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
     }
@@ -260,6 +277,7 @@ async fn collect_overview(
     http: &reqwest::Client,
     base_url: &str,
     business: &[BusinessUnit],
+    tenant: &str,
 ) -> Result<Value, String> {
     let self_metrics = format!(
         "{{__name__=~\"{}\"}}",
@@ -280,11 +298,11 @@ async fn collect_overview(
 
     // 四个查询并发：页面的四块信息互不依赖，串行只会把首页拖慢四倍。
     let (catalog, per_agent, values, host_values, samples) = tokio::join!(
-        query(http, base_url, &catalog_expr),
-        query(http, base_url, &per_agent_expr),
-        query(http, base_url, &self_metrics),
-        query(http, base_url, &host_metrics),
-        query(http, base_url, &samples_expr),
+        query(http, base_url, &catalog_expr, tenant),
+        query(http, base_url, &per_agent_expr, tenant),
+        query(http, base_url, &self_metrics, tenant),
+        query(http, base_url, &host_metrics, tenant),
+        query(http, base_url, &samples_expr, tenant),
     );
     // 任一失败就整页失败：半页数据比一句明确的报错更容易误导人。
     let mut catalog = catalog?;
@@ -556,6 +574,7 @@ async fn collect_history(
     agent_id: &str,
     window: i64,
     step: i64,
+    tenant: &str,
 ) -> Result<AgentHistory, String> {
     let expr = format!(
         "{{{}=\"{}\", __name__=~\"{}\"}}",
@@ -586,10 +605,10 @@ async fn collect_history(
         names_for(&["host.filesystem.usage_ratio"])
     );
     let (self_result, load_mem, disk, filesystem) = tokio::join!(
-        query_range(http, base_url, &expr, window, step),
-        query_range(http, base_url, &host_load_mem, window, step),
-        query_range(http, base_url, &host_disk, window, step),
-        query_range(http, base_url, &host_filesystem, window, step),
+        query_range(http, base_url, &expr, tenant, window, step),
+        query_range(http, base_url, &host_load_mem, tenant, window, step),
+        query_range(http, base_url, &host_disk, tenant, window, step),
+        query_range(http, base_url, &host_filesystem, tenant, window, step),
     );
 
     let mut labels = BTreeMap::new();
@@ -698,9 +717,43 @@ fn history_window(window: Option<i64>, step: Option<i64>) -> (i64, i64) {
 }
 
 /// GET `/api/v1/query`，返回 `data.result`。
-async fn query(http: &reqwest::Client, base_url: &str, expr: &str) -> Result<Vec<Value>, String> {
+/// 把当前客户拼进 PromQL 的 label selector。
+///
+/// 为什么要在这里做：指标和证据一样按客户隔离，但它们都落在**同一个 VM** 里，
+/// 唯一的区分是 `tenant_id` label（来自网关绑定的 `WP_GLOBAL_TAGS=tenant_id=<id>`）。
+/// 本文件的表达式只有两种形态：`{...}` 与 `count by (x) ({...})`，所以逐 `{` 注入即可。
+///
+/// `tenant` 为空（不属于单客户站点的异常态）时原样返回 —— 宁可变回旧行为，也不拼出非法 PromQL。
+fn scope_tenant(expr: &str, tenant: &str) -> String {
+    let tenant = tenant.trim();
+    if tenant.is_empty() {
+        return expr.to_string();
+    }
+    let escaped = tenant.replace('\\', "\\\\").replace('"', "\\\"");
+    let matcher = format!("tenant_id=\"{escaped}\"");
+    let mut out = String::with_capacity(expr.len() + matcher.len() + 8);
+    let mut rest = expr;
+    while let Some(pos) = rest.find('{') {
+        out.push_str(&rest[..=pos]);
+        rest = &rest[pos + 1..];
+        out.push_str(&matcher);
+        if !rest.starts_with('}') {
+            out.push_str(", ");
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+async fn query(
+    http: &reqwest::Client,
+    base_url: &str,
+    expr: &str,
+    tenant: &str,
+) -> Result<Vec<Value>, String> {
     let url = format!("{base_url}/api/v1/query");
-    let payload = get_json(http, &url, &[("query", expr)]).await?;
+    let scoped = scope_tenant(expr, tenant);
+    let payload = get_json(http, &url, &[("query", scoped.as_str())]).await?;
     Ok(payload["data"]["result"]
         .as_array()
         .cloned()
@@ -712,6 +765,7 @@ async fn query_range(
     http: &reqwest::Client,
     base_url: &str,
     expr: &str,
+    tenant: &str,
     window: i64,
     step: i64,
 ) -> Result<Vec<Value>, String> {
@@ -720,11 +774,12 @@ async fn query_range(
     let start = (now - window).to_string();
     let end = now.to_string();
     let step = step.to_string();
+    let scoped = scope_tenant(expr, tenant);
     let payload = get_json(
         http,
         &url,
         &[
-            ("query", expr),
+            ("query", scoped.as_str()),
             ("start", start.as_str()),
             ("end", end.as_str()),
             ("step", step.as_str()),
@@ -881,5 +936,45 @@ mod tests {
         assert_eq!(row.disk_usage_max, Some(60.0));
         // 没归属的主机单列，不默默漏掉。
         assert_eq!(unassigned, vec!["c".to_string()]);
+    }
+}
+
+#[cfg(test)]
+mod tenant_scope_tests {
+    use super::scope_tenant;
+
+    #[test]
+    fn injects_the_tenant_into_every_selector() {
+        assert_eq!(
+            scope_tenant("count by (agent) ({__name__=~\".+\"})", "acme"),
+            "count by (agent) ({tenant_id=\"acme\", __name__=~\".+\"})"
+        );
+        assert_eq!(
+            scope_tenant("{__name__=~\"a|b\"}", "acme"),
+            "{tenant_id=\"acme\", __name__=~\"a|b\"}"
+        );
+    }
+
+    #[test]
+    fn handles_an_empty_selector() {
+        assert_eq!(
+            scope_tenant("sum by (agent) (count_over_time({}[300s]))", "acme"),
+            "sum by (agent) (count_over_time({tenant_id=\"acme\"}[300s]))"
+        );
+    }
+
+    #[test]
+    fn an_empty_tenant_keeps_the_expression_untouched() {
+        let expr = "max by (agent) ({agent=\"a\"})";
+        assert_eq!(scope_tenant(expr, ""), expr);
+        assert_eq!(scope_tenant(expr, "   "), expr);
+    }
+
+    #[test]
+    fn values_with_quotes_are_escaped() {
+        assert_eq!(
+            scope_tenant("{a=\"1\"}", "we\"ird"),
+            "{tenant_id=\"we\\\"ird\", a=\"1\"}"
+        );
     }
 }

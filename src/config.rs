@@ -95,7 +95,15 @@ pub struct CredentialsConfig {
 #[derive(Debug, Clone)]
 pub struct EvidenceConfig {
     pub base_url: String,
-    pub tenant: String,
+    /// 单客户站点的兜底租户（也是多客户部署里“没有可选集合”时的值）。
+    ///
+    /// **不返回给前端**：前端只拿到 `tenants` 集合（见 `/api/session`），
+    /// 不允许它猜一个默认值 —— 那类“默认选第一个”正是越权/看错客户的来源。
+    pub default_tenant: Option<String>,
+    /// 多客户：当前令牌可切的客户集合（M1.5 来自配置；M2 换成凭据的 `resources.tenants`）。
+    ///
+    /// 空 = 单客户站点（行为与旧版完全一致）。
+    pub allowed_tenants: Vec<String>,
     pub scopes: Vec<String>,
     pub max_sensitivity: String,
     pub timeout_secs: u64,
@@ -320,7 +328,11 @@ fn default_operator_header() -> String {
 #[derive(Debug, Deserialize)]
 struct RawEvidence {
     base_url: String,
-    tenant: String,
+    /// 旧名 `tenant` 仍可读（现场老配置不用改）。
+    #[serde(default, alias = "tenant")]
+    default_tenant: Option<String>,
+    #[serde(default)]
+    allowed_tenants: Vec<String>,
     #[serde(default = "default_scopes")]
     scopes: Vec<String>,
     #[serde(default = "default_max_sensitivity")]
@@ -372,8 +384,17 @@ impl RawConfig {
         if self.auth.operator_header.trim().is_empty() {
             bail!("auth.operator_header must not be empty");
         }
-        if self.evidence.tenant.trim().is_empty() {
-            bail!("evidence.tenant must not be empty");
+        // 单客户站点：没有可选集合时，必须有一个兜底租户（否则不知道该查谁）。
+        if self.evidence.allowed_tenants.is_empty()
+            && self
+                .evidence
+                .default_tenant
+                .as_deref()
+                .map(str::trim)
+                .unwrap_or("")
+                .is_empty()
+        {
+            bail!("evidence.default_tenant (or allowed_tenants) must not be empty");
         }
         if self.evidence.scopes.is_empty() {
             bail!("evidence.scopes must list at least one scope");
@@ -424,7 +445,24 @@ impl RawConfig {
             },
             evidence: EvidenceConfig {
                 base_url: expand(env, &self.evidence.base_url)?,
-                tenant: self.evidence.tenant,
+                // 租户要能写 `${EVIDENCE_TENANT}`：以前没走 expand，模板只能写字面量。
+                default_tenant: match self.evidence.default_tenant.as_deref() {
+                    Some(raw) if !raw.trim().is_empty() => Some(expand(env, raw)?),
+                    _ => None,
+                },
+                allowed_tenants: {
+                    let mut tenants = Vec::new();
+                    for raw in &self.evidence.allowed_tenants {
+                        let tenant = expand(env, raw)?.trim().to_string();
+                        if tenant.is_empty() {
+                            continue;
+                        }
+                        if !tenants.contains(&tenant) {
+                            tenants.push(tenant);
+                        }
+                    }
+                    tenants
+                },
                 scopes: self.evidence.scopes,
                 max_sensitivity: expires,
                 timeout_secs: self.evidence.timeout_secs,
@@ -672,5 +710,73 @@ mod tests {
         )
         .expect_err("shared hosts double-count投入, so they are rejected");
         assert!(error.to_string().contains("assigned to both"), "{error}");
+    }
+}
+
+#[cfg(test)]
+mod tenant_config_tests {
+    use super::*;
+
+    fn parse_with(raw: &str, env: EnvDict) -> anyhow::Result<Config> {
+        let raw: RawConfig = toml::from_str(raw)?;
+        raw.resolve(&env)
+    }
+
+    fn base() -> &'static str {
+        r#"
+        [credentials]
+        file = "/etc/wist-field-api/cred/cred.toml"
+
+        [evidence]
+        base_url = "http://127.0.0.1:8443"
+        "#
+    }
+
+    #[test]
+    fn the_old_field_name_is_still_accepted() {
+        // 现场老配置写的是 `tenant = "..."`；改名不能让它变成“静默没有租户”。
+        let config = parse_with(
+            &format!("{}{}", base(), "tenant = \"t-001\"\n"),
+            EnvDict::new(),
+        )
+        .expect("legacy field should parse");
+        assert_eq!(config.evidence.default_tenant.as_deref(), Some("t-001"));
+        assert!(config.evidence.allowed_tenants.is_empty());
+    }
+
+    #[test]
+    fn a_deployment_with_neither_tenant_nor_set_is_rejected() {
+        let error = parse_with(base(), EnvDict::new())
+            .expect_err("no tenant at all must fail at startup, not at request time");
+        assert!(error.to_string().contains("default_tenant"));
+    }
+
+    #[test]
+    fn tenants_are_expanded_and_deduplicated() {
+        let mut env = EnvDict::new();
+        env.insert("EVIDENCE_TENANT", ValueType::from("t-001"));
+        env.insert("TENANT_B", ValueType::from("t-002"));
+        let config = parse_with(
+            &format!(
+                "{}default_tenant = \"${{EVIDENCE_TENANT}}\"\n\
+                 allowed_tenants = [\"${{EVIDENCE_TENANT}}\", \"${{TENANT_B}}\", \"t-002\"]\n",
+                base()
+            ),
+            env,
+        )
+        .expect("expanded tenants");
+        assert_eq!(config.evidence.default_tenant.as_deref(), Some("t-001"));
+        // 去重保留首次出现的顺序。
+        assert_eq!(config.evidence.allowed_tenants, vec!["t-001", "t-002"]);
+    }
+
+    #[test]
+    fn empty_tenant_entries_are_dropped() {
+        let config = parse_with(
+            &format!("{}allowed_tenants = [\"  \", \"t-001\"]\n", base()),
+            EnvDict::new(),
+        )
+        .expect("empty entries are ignored, not fatal");
+        assert_eq!(config.evidence.allowed_tenants, vec!["t-001"]);
     }
 }

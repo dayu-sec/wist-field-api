@@ -54,6 +54,22 @@ async fn main() -> anyhow::Result<()> {
             .map(|atlas| atlas.base_url.as_str())
             .unwrap_or("(none)")
     );
+    // 租户态：多客户站点最常见的问题就是“页面 400/403 但不知道为什么”，
+    // 启动时把“有几个可选客户”打出来，比现场猜配置快得多。
+    log::info!(
+        "evidence tenants: default={} allowed={} {}",
+        config
+            .evidence
+            .default_tenant
+            .as_deref()
+            .unwrap_or("(none)"),
+        config.evidence.allowed_tenants.len(),
+        if config.evidence.allowed_tenants.len() > 1 {
+            "(multi-customer: requests must pass ?tenant=<id>)"
+        } else {
+            "(single-customer site)"
+        }
+    );
 
     let state = AppState {
         config: Arc::new(config.clone()),

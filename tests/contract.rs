@@ -33,7 +33,8 @@ fn config(base_url: String, mode: AuthMode) -> Config {
         credentials: None,
         evidence: EvidenceConfig {
             base_url,
-            tenant: "t-001".to_string(),
+            default_tenant: Some("t-001".to_string()),
+            allowed_tenants: Vec::new(),
             scopes: vec!["evidence:read".to_string()],
             max_sensitivity: "paths".to_string(),
             timeout_secs: 5,
@@ -250,17 +251,31 @@ async fn call(app: &Router, request: Request<Body>) -> (StatusCode, Value) {
 }
 
 #[tokio::test]
-async fn list_is_passed_through_and_tenant_is_stripped() {
+async fn an_out_of_set_tenant_is_rejected_instead_of_being_silently_dropped() {
     let base = spawn_stub().await;
     let app = api::router(state(config(base, AuthMode::Ingress)));
+    // 单客户站点：`t-001` 是唯一可用的客户；传别的 → 403（不再静默改用配置值）。
     let request = Request::builder()
         .uri("/api/evidence?tenant=t-999&kind=investigation_report")
         .header("x-console-operator", "zhangsan")
         .body(Body::empty())
         .unwrap();
     let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "tenant_not_allowed");
+}
+
+#[tokio::test]
+async fn single_tenant_site_uses_the_configured_default() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config(base, AuthMode::Ingress)));
+    let request = Request::builder()
+        .uri("/api/evidence?kind=investigation_report")
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    // 浏览器传的 tenant 必须被丢掉；真正生效的是配置里的身份。
     assert_eq!(body["seen_query"], "kind=investigation_report");
     assert_eq!(body["seen_tenant"], "t-001");
     assert_eq!(body["seen_scopes"], "evidence:read");
@@ -1171,4 +1186,176 @@ async fn metrics_without_a_store_is_503_not_an_error_page() {
             .unwrap()
             .contains("metrics.base_url")
     );
+}
+
+// ── 多客户（M1.5）：`?tenant=` 校验与 `/api/session` ────────────────────
+
+fn config_with_tenants(
+    base_url: String,
+    mode: AuthMode,
+    default_tenant: Option<&str>,
+    allowed: &[&str],
+) -> Config {
+    let mut cfg = config(base_url, mode);
+    cfg.evidence.default_tenant = default_tenant.map(str::to_string);
+    cfg.evidence.allowed_tenants = allowed.iter().map(|t| t.to_string()).collect();
+    cfg
+}
+
+fn operator_get(uri: &str) -> Request<Body> {
+    Request::builder()
+        .uri(uri)
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn multi_tenant_site_requires_an_explicit_tenant() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config_with_tenants(
+        base,
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    )));
+    let (status, body) = call(&app, operator_get("/api/evidence")).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "tenant_required");
+}
+
+#[tokio::test]
+async fn multi_tenant_site_routes_to_the_requested_tenant() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config_with_tenants(
+        base,
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    )));
+    let (status, body) = call(&app, operator_get("/api/evidence?tenant=t-002&kind=x")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["seen_tenant"], "t-002");
+    // `tenant` 不能当成过滤条件透传给证据服务。
+    assert_eq!(body["seen_query"], "kind=x");
+}
+
+#[tokio::test]
+async fn multi_tenant_site_rejects_a_tenant_outside_the_set() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config_with_tenants(
+        base,
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    )));
+    let (status, body) = call(&app, operator_get("/api/evidence?tenant=t-999")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "tenant_not_allowed");
+}
+
+#[tokio::test]
+async fn session_lists_tenants_and_never_the_default() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config_with_tenants(
+        base,
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    )));
+    let (status, body) = call(&app, operator_get("/api/session")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tenants"], json!(["t-001", "t-002"]));
+    // 默认客户**不得**回给前端：那会让前端“猜一个默认值”，正是看错客户的来源。
+    assert!(body.get("default_tenant").is_none(), "{body}");
+}
+
+#[tokio::test]
+async fn single_tenant_site_has_an_empty_session_set() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config(base, AuthMode::Ingress)));
+    let (status, body) = call(&app, operator_get("/api/session")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["tenants"], json!([]));
+}
+
+// ── 多客户：边界、兼容与不泄露（R2/R3/R4）────────────────────────────
+
+#[tokio::test]
+async fn an_empty_tenant_parameter_falls_back_in_a_single_tenant_site() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config(base, AuthMode::Ingress)));
+    let (status, body) = call(&app, operator_get("/api/evidence?tenant=&kind=x")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["seen_tenant"], "t-001");
+    // 空的 `tenant=` 也不能被当成过滤条件透传。
+    assert_eq!(body["seen_query"], "kind=x");
+}
+
+#[tokio::test]
+async fn a_repeated_tenant_parameter_takes_the_last_one() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config_with_tenants(
+        base,
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    )));
+    let (status, body) = call(
+        &app,
+        operator_get("/api/evidence?tenant=t-001&tenant=t-002"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["seen_tenant"], "t-002");
+}
+
+#[tokio::test]
+async fn the_rejection_does_not_echo_the_requested_tenant() {
+    let base = spawn_stub().await;
+    let app = api::router(state(config_with_tenants(
+        base,
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001"],
+    )));
+    let (status, body) = call(&app, operator_get("/api/evidence?tenant=secret-customer")).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    let text = body.to_string();
+    assert!(
+        !text.contains("secret-customer"),
+        "越界响应不能回显客户 id（会泄露存在性）：{text}"
+    );
+}
+
+#[tokio::test]
+async fn a_tenant_is_required_on_every_read_path_not_only_the_list() {
+    let base = spawn_stub().await;
+    for uri in ["/api/evidence/art_1", "/api/evidence/art_1/content"] {
+        let app = api::router(state(config_with_tenants(
+            base.clone(),
+            AuthMode::Ingress,
+            Some("t-001"),
+            &["t-001", "t-002"],
+        )));
+        let (status, body) = call(&app, operator_get(uri)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], "tenant_required", "{uri}");
+    }
+}
+
+#[tokio::test]
+async fn atlas_proxy_is_not_tenant_scoped_yet() {
+    // 已知缺口：atlas 的租户模型独立（UUID），本期不按客户过滤。
+    // 这条用例**锁定现状**，免得日后被误认为“已隔离”。
+    let base = spawn_stub().await;
+    let app = api::router(state(config_with_tenants(
+        base,
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    )));
+    let (status, _body) = call(&app, operator_get("/api/atlas/hosts")).await;
+    assert_ne!(status, StatusCode::BAD_REQUEST, "atlas 代理不该要求 tenant");
+    assert_ne!(status, StatusCode::FORBIDDEN);
 }

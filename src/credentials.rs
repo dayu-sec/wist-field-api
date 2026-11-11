@@ -244,6 +244,56 @@ pub struct Caller {
     pub roles: Vec<String>,
 }
 
+/// 一次请求的调用方（**服务端算出来的**身份，不是浏览器自述）。
+///
+/// `tenants` 决定“这次能看哪个客户”。M1.5 的来源是配置（`evidence.allowed_tenants`），
+/// M2 会换成凭据里的 `resources.tenants` —— 只有这一处数据源变，下面的 `resolve_tenant`
+/// 与所有读路径的校验点不变。
+#[derive(Debug, Clone)]
+pub struct Principal {
+    pub subject: String,
+    pub roles: Vec<String>,
+    /// 可选客户集合。**空 = 单客户站点**（由配置的 `default_tenant` 兜底）。
+    pub tenants: Vec<String>,
+}
+
+/// 选客户失败的两类原因（对外分别是 400 / 403）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TenantError {
+    /// 多客户站点但没指定客户。
+    Required,
+    /// 指定了，但不在可选集合里（**不回显该客户是否存在**）。
+    NotAllowed,
+}
+
+impl Principal {
+    /// 定下这次请求用哪个客户。
+    ///
+    /// 顺序：显式指定（必须在集合内）→ 集合只有一个就自动用 → 否则用兜底租户（仅单客户站点）。
+    /// 多客户不带 `tenant` 一律拒，不“默认取第一个”：那类退化正是看错客户/越权的来源。
+    pub fn resolve_tenant(
+        &self,
+        requested: Option<&str>,
+        default_tenant: Option<&str>,
+    ) -> Result<String, TenantError> {
+        let requested = requested.map(str::trim).filter(|value| !value.is_empty());
+        if let Some(tenant) = requested {
+            return if self.tenants.iter().any(|allowed| allowed == tenant) {
+                Ok(tenant.to_string())
+            } else {
+                Err(TenantError::NotAllowed)
+            };
+        }
+        match self.tenants.len() {
+            0 => default_tenant
+                .map(str::to_string)
+                .ok_or(TenantError::Required),
+            1 => Ok(self.tenants[0].clone()),
+            _ => Err(TenantError::Required),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VerifyError {
     /// 没带 token / token 不认识 / 过期 / 撤销 / audience 不符。
