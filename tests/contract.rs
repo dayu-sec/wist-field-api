@@ -1345,17 +1345,43 @@ async fn a_tenant_is_required_on_every_read_path_not_only_the_list() {
 }
 
 #[tokio::test]
-async fn atlas_proxy_is_not_tenant_scoped_yet() {
-    // 已知缺口：atlas 的租户模型独立（UUID），本期不按客户过滤。
-    // 这条用例**锁定现状**，免得日后被误认为“已隔离”。
+async fn atlas_is_refused_on_multi_tenant_sites() {
+    // atlas 的租户是独立 UUID，读接口也还不按客户过滤（docs/multi-customer.md §5.7）。
+    // 多客户站点必须**显式失效**：否则是“看着能用、实际跨客户可见”的半可用状态。
     let base = spawn_stub().await;
-    let app = api::router(state(config_with_tenants(
-        base,
+    let mut cfg = config_with_tenants(
+        base.clone(),
         AuthMode::Ingress,
         Some("t-001"),
         &["t-001", "t-002"],
-    )));
-    let (status, _body) = call(&app, operator_get("/api/atlas/hosts")).await;
-    assert_ne!(status, StatusCode::BAD_REQUEST, "atlas 代理不该要求 tenant");
-    assert_ne!(status, StatusCode::FORBIDDEN);
+    );
+    cfg.atlas = Some(AtlasConfig {
+        base_url: base,
+        auth_token: None,
+        sink_url: None,
+    });
+    let app = api::router(state(cfg));
+
+    let (status, body) = call(&app, operator_get("/api/atlas/hosts")).await;
+    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
+    assert_eq!(body["error"]["code"], "atlas_not_multi_tenant");
+    // 失效提示不回显客户 id：客户清单本身也是信息。
+    let text = body.to_string();
+    assert!(!text.contains("t-001") && !text.contains("t-002"), "{text}");
+}
+
+#[tokio::test]
+async fn atlas_proxy_still_works_with_a_single_customer() {
+    // 单客户站点（含“白名单里只有一个客户”的站点）不受这条闸门影响。
+    let base = spawn_stub().await;
+    let mut cfg = config_with_tenants(base.clone(), AuthMode::Ingress, Some("t-001"), &["t-001"]);
+    cfg.atlas = Some(AtlasConfig {
+        base_url: base,
+        auth_token: None,
+        sink_url: None,
+    });
+    let app = api::router(state(cfg));
+
+    let (status, body) = call(&app, operator_get("/api/atlas/hosts")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
 }

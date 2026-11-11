@@ -488,6 +488,17 @@ async fn proxy_atlas(
             "this service has no atlas.base_url configured",
         );
     };
+
+    // atlas 尚未按客户隔离（docs/multi-customer.md §5.7）：多客户站点直接关掉。
+    // 现在它是“看着能用、实际跨客户可见”—— 这种半可用状态比坏掉更危险，
+    // 与“页面能开但永远 401”同一类问题。单客户站点不受影响。
+    if state.config.evidence.allowed_tenants.len() > 1 {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "atlas_not_multi_tenant",
+            "atlas is not tenant-isolated yet; asset topology is disabled on multi-customer sites",
+        );
+    }
     // 写端点与路径穿越都不放行：这里只代理 atlas 的公开读接口。
     let rest = rest.trim_start_matches('/');
     if rest.is_empty() || rest.contains("..") || rest.contains("//") || rest.starts_with("internal")
