@@ -1,6 +1,18 @@
 # CHANGELOG
 
+## 0.7.2 · 2026-11-11
+
+- **修镜像构建**：`docker/Dockerfile` 不再跑 `apt-get`。
+  `ubuntu:24.04` 本来就自带 `useradd`，运行期真正缺的只有「根证书 + 静态 busybox」，
+  改成从 `alpine` / `busybox` 镜像直接 `COPY`，少一个构建期网络依赖。
+  起因：GitHub runner 的 buildkit 容器解析不了 `archive.ubuntu.com` / `ports.ubuntu.com`，
+  `apt-get update` 连续三次 `exit 100`，把一条只做打包、零编译动作的流水线卡死。
+  镜像内容与 0.7.1 一致（二进制没变），只是打包方式变了。
+
 ## 0.7.1 · 2026-11-11
+
+> ⚠ 这个版本**只发布了二进制，没有镜像**：镜像构建被 CI 网络故障挡住，见 0.7.2。
+> 部署请用 0.7.2 及以后。
 
 - **`/api/atlas/*` 在多客户站点显式失效**：返回 `501 atlas_not_multi_tenant`。
   atlas 的租户是独立 UUID，读接口也还不按客户过滤 —— 多客户站点继续放行等于
