@@ -176,13 +176,41 @@ async fn stub_vm_range(Query(params): Query<HashMap<String, String>>) -> axum::J
     }))
 }
 
+/// 老一套指标 label：**没有** `tenant_id`。多客户站点能拦不拦就看这条。
+fn vm_labels_without_tenant() -> Vec<String> {
+    ["__name__", "agent", "env"]
+        .iter()
+        .map(|label| label.to_string())
+        .collect()
+}
+
 async fn spawn_stub() -> String {
-    spawn_stub_with_healthz(json!({ "status": "ok", "objects": { "kind": "file" } })).await
+    spawn_stub_full(
+        json!({ "status": "ok", "objects": { "kind": "file" } }),
+        vm_labels_without_tenant(),
+    )
+    .await
+}
+
+/// 数据面已经打上 `tenant_id` 的站点（网关租户绑定生效后的形状）。
+async fn spawn_stub_with_tenant_labels() -> String {
+    let mut labels = vm_labels_without_tenant();
+    labels.push("tenant_id".to_string());
+    spawn_stub_full(
+        json!({ "status": "ok", "objects": { "kind": "file" } }),
+        labels,
+    )
+    .await
 }
 
 /// 同一个桩，但指定证据服务 `/healthz` 的正文 ——
 /// 用来验「老证据服务不报 `objects` 时不把能力当成不支持」。
 async fn spawn_stub_with_healthz(healthz_body: Value) -> String {
+    spawn_stub_full(healthz_body, vm_labels_without_tenant()).await
+}
+
+/// 桩的可变部分（证据服务 `/healthz` 正文、指标 label 集合）都在这里定。
+async fn spawn_stub_full(healthz_body: Value, vm_labels: Vec<String>) -> String {
     let app = Router::new()
         .route(
             "/healthz",
@@ -195,6 +223,14 @@ async fn spawn_stub_with_healthz(healthz_body: Value) -> String {
         .route("/health", get(|| async { "OK" }))
         .route("/api/v1/query", get(stub_vm_query))
         .route("/api/v1/query_range", get(stub_vm_range))
+        // BFF 靠这个端点判断「指标里到底有没有 tenant_id」。
+        .route(
+            "/api/v1/labels",
+            get(move || {
+                let labels = vm_labels.clone();
+                async move { axum::Json(json!({ "status": "success", "data": labels })) }
+            }),
+        )
         // atlas 的读接口（console 以 `/api/atlas/*` 代理过去）。
         // 把收到的 query 原样回显，用例才能断言 BFF 究竟转了什么给上游。
         .route(
@@ -1452,4 +1488,72 @@ async fn atlas_proxy_still_works_with_a_single_customer() {
             .contains("tenant=t-001"),
         "{body}"
     );
+}
+
+// ── 多客户站点：指标必须真带 `tenant_id`（S7）──────────────────────────
+
+/// 多客户站点里所有客户共用一个 VM，唯一的隔离手段就是 `tenant_id` label。
+/// 数据面没打标时查询只会返回空 —— 页面看起来像“这个客户没数据”，没人会往
+/// “网关没绑定租户”上想。所以这里必须明确报错，而不是给一张空图表。
+#[tokio::test]
+async fn multi_customer_metrics_are_blocked_without_a_tenant_label() {
+    // 桩默认就是老一套 label（没有 tenant_id）。
+    let base = spawn_stub().await;
+    let mut cfg = config_with_tenants(
+        base.clone(),
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    );
+    cfg.metrics = Some(MetricsConfig {
+        base_url: base,
+        write_url: None,
+    });
+    let app = api::router(state(cfg));
+
+    // 概览与历史两条读路径都要拦（页面会并发发这两种请求）。
+    for uri in [
+        "/api/metrics?tenant=t-001",
+        "/api/metrics/agents/agent-a/history?tenant=t-001",
+    ] {
+        let (status, body) = call(&app, operator_get(uri)).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+        assert_eq!(body["error"]["code"], "metrics_tenant_label_missing");
+    }
+}
+
+#[tokio::test]
+async fn multi_customer_metrics_pass_once_the_tenant_label_exists() {
+    let base = spawn_stub_with_tenant_labels().await;
+    let mut cfg = config_with_tenants(
+        base.clone(),
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    );
+    cfg.metrics = Some(MetricsConfig {
+        base_url: base,
+        write_url: None,
+    });
+    let app = api::router(state(cfg));
+
+    let (status, body) = call(&app, operator_get("/api/metrics?tenant=t-001")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["agents"][0]["agent_id"], "agent-a");
+}
+
+/// 单客户站点的老数据可能就没打标，不能因此把既有页面弄挂。
+#[tokio::test]
+async fn single_customer_metrics_do_not_require_a_tenant_label() {
+    let base = spawn_stub().await;
+    let mut cfg = config_with_tenants(base.clone(), AuthMode::Ingress, Some("t-001"), &["t-001"]);
+    cfg.metrics = Some(MetricsConfig {
+        base_url: base,
+        write_url: None,
+    });
+    let app = api::router(state(cfg));
+
+    let (status, body) = call(&app, operator_get("/api/metrics")).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["agents"][0]["agent_id"], "agent-a");
 }

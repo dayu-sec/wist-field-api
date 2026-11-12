@@ -12,8 +12,9 @@
 //! 业务层来自 `field-api.toml` 的主机归属（见 [`BusinessRow`]），服务层与中间件层
 //! 由前端按 `app` label 与指标名前缀分组（无需额外查询）。
 
-use std::collections::{BTreeMap, HashSet};
-use std::time::Duration;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::extract::{Path, Query, RawQuery, State};
@@ -183,6 +184,9 @@ pub async fn overview(
     let Some(config) = metrics_config(&state) else {
         return not_configured();
     };
+    if let Err(response) = ensure_tenant_label(&state, &state.http, &config).await {
+        return *response;
+    }
     match collect_overview(&state.http, &config, &state.config.business, &tenant).await {
         Ok(value) => Json(value).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
@@ -210,9 +214,68 @@ pub async fn agent_history(
     };
 
     let (window, step) = history_window(query.window_seconds, query.step_seconds);
+    if let Err(response) = ensure_tenant_label(&state, &state.http, &config).await {
+        return *response;
+    }
     match collect_history(&state.http, &config, &agent_id, window, step, &tenant).await {
         Ok(history) => Json(history).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
+    }
+}
+
+/// 数据面的指标里有没有 `tenant_id` label（按 `base_url` 缓存 60s）。
+///
+/// 为什么要缓：一个页面会并发发 4~5 条查询，每次都去拉一次 labels 是纯浪费；
+/// 而 60s 足够让「刚绑完客户还没重启数据面」这种现场被发现。
+async fn tenant_label_present(http: &reqwest::Client, base_url: &str) -> Result<bool, String> {
+    if let Ok(cache) = label_cache().lock()
+        && let Some((at, value)) = cache.get(base_url)
+        && at.elapsed() < LABEL_CACHE_TTL
+    {
+        return Ok(*value);
+    }
+    let labels = get_json(http, &format!("{base_url}/api/v1/labels"), &[]).await?;
+    let present = labels["data"]
+        .as_array()
+        .map(|labels| {
+            labels
+                .iter()
+                .any(|label| label.as_str() == Some("tenant_id"))
+        })
+        .unwrap_or(false);
+    if let Ok(mut cache) = label_cache().lock() {
+        cache.insert(base_url.to_string(), (Instant::now(), present));
+    }
+    Ok(present)
+}
+
+/// 多客户站点：先确认指标里真有 `tenant_id` label，没有就**明确报错**。
+///
+/// 不拦的后果很阴：VM 里所有客户共用一个库，唯一的隔离手段就是这条 label；
+/// 数据面没打标时查询只会返回空 —— 页面看起来像“这个客户没有指标”，人不会往
+/// “网关没绑定租户”上想。单客户站点不拦（老数据可能没打标，别弄挂既有页面）。
+/// `Response` 大到 clippy 不让直接当 `Err`（`result_large_err`），装箱。
+async fn ensure_tenant_label(
+    state: &AppState,
+    http: &reqwest::Client,
+    base_url: &str,
+) -> Result<(), Box<Response>> {
+    if state.config.evidence.allowed_tenants.len() <= 1 {
+        return Ok(());
+    }
+    match tenant_label_present(http, base_url).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Box::new(error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "metrics_tenant_label_missing",
+            "指标里没有 tenant_id label，多客户站点无法按客户隔离查询：\
+             检查网关的租户绑定（WIST_TENANT_ID → WP_GLOBAL_TAGS）是否生效",
+        ))),
+        Err(err) => Err(Box::new(error_response(
+            StatusCode::BAD_GATEWAY,
+            "metrics_unavailable",
+            err,
+        ))),
     }
 }
 
@@ -230,6 +293,14 @@ fn not_configured() -> Response {
         "metrics_not_configured",
         "未配置 metrics.base_url（field-api.toml 的 [metrics] 段）：这个计算区还没有指标存储",
     )
+}
+
+const LABEL_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// 每个 `metrics.base_url` 一份缓存（测试里会起多个桩端口，不能全局共用）。
+fn label_cache() -> &'static Mutex<HashMap<String, (Instant, bool)>> {
+    static CACHE: OnceLock<Mutex<HashMap<String, (Instant, bool)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 /// 主机侧要展示的 fact（**用 fact_key 查 spec 表**，不手写指标名）。
