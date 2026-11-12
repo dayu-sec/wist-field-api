@@ -1,5 +1,17 @@
 # CHANGELOG
 
+## 0.7.4 · 2026-11-12
+
+- **预签名能力只认 `s3`**：`/api/evidence/capabilities` 的 `presign_supported` 原来是
+  「不等于 `file` 就可签」，现在改成「**只有明确报 `s3`** 才可签」。
+  起因：`wist-evidence` 0.3.0 多客户部署会报 `objects.kind = mixed`（部分客户在本地目录），
+  旧判法会说「可签」，页面先吃一个 501 再回落。`file` / `mixed` / 探测不到一律走
+  BFF 代理读正文（两种后端都读得出来）。
+- **`/healthz` 回显启动时读到的客户清单**（S4）：`{"status":"ok",
+  "customers":{"mode":"single|multi","ids":[...]},"auth":"cred|ingress"}`。
+  多客户站点的故障大多是「客户集合不对」（清单没对齐 / 忘了 localize / 容器没重建），
+  这一行就能一眼看出来。**不报**证据地址与 default tenant（服务端兜底，不外露）。
+
 ## 0.7.3 · 2026-11-11
 
 - **资产拓扑按客户隔离**：`/api/atlas/*` 不再多客户站点一律 501。

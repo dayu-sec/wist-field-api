@@ -133,8 +133,25 @@ async fn require_initialized(
     next.run(request).await
 }
 
-async fn healthz() -> Json<serde_json::Value> {
-    Json(json!({ "status": "ok" }))
+/// `/healthz`：进程活着 + **启动时读到的客户清单**（配错了第一眼就能看出来）。
+///
+/// 回显清单而不是“就绪了”三个字：多客户站点的绝大多数故障都是「客户集合不对」
+/// （清单没与 cells 对齐 / 忘了 localize / 容器没重建），而那正是这里能把住的。
+/// 只报 **id 与模式**：不报证据地址、不报 default tenant（那是服务端兜底，不对外）。
+async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let tenants = &state.config.evidence.allowed_tenants;
+    Json(json!({
+        "status": "ok",
+        "customers": {
+            // 集合里有多个才需要调用方显式选客户；单个/为空都是单客户站点的形态。
+            "mode": if tenants.len() > 1 { "multi" } else { "single" },
+            "ids": tenants,
+        },
+        "auth": match state.config.auth.mode {
+            AuthMode::Cred => "cred",
+            AuthMode::Ingress => "ingress",
+        },
+    }))
 }
 
 /// 聚合各数据源的就绪度。`not_configured` 不是错误 —— 是「这个域还没接」。
@@ -346,11 +363,10 @@ async fn integration(
 ///
 /// 页面据 `presign_supported` 决定「打开正文」走哪条路：
 /// - `objects.kind = s3`：一次 60s 单对象签名，浏览器直连对象存储；
-/// - `objects.kind = file`：没有签名 URL，走 BFF 代理读（`/api/evidence/{id}/content`）。
+/// - 其他（`file` / `mixed` / 探测失败 / 老服务不报 `objects`）：走 BFF 代理读正文。
 ///
-/// 探测失败、或老证据服务的 `/healthz` 不报 `objects` 时回 `objects_kind: null`
-/// 且 `presign_supported: true`：页面退回到「先试签名、501 再回落」的老行为 ——
-/// 能力探测失败不应该把正文读不了当结果。
+/// 为什么只认 `s3`：`mixed` 意味着至少有一个客户在本地目录上（签不出来），
+/// 而本地文件与 S3 都能被 BFF 代理读出来 —— 把「能不能签」判宽了，页面会先吃一个 501。
 async fn evidence_capabilities(State(state): State<AppState>, headers: HeaderMap) -> Response {
     if let Err(err) = require_operator(&state, &headers) {
         return err.into_response();
@@ -360,7 +376,7 @@ async fn evidence_capabilities(State(state): State<AppState>, headers: HeaderMap
         Err(err) => return upstream_failed(err),
     };
     let objects_kind = evidence_objects_kind(&response.body);
-    let presign_supported = objects_kind.as_deref() != Some("file");
+    let presign_supported = objects_kind.as_deref() == Some("s3");
     Json(json!({
         "objects_kind": objects_kind,
         "presign_supported": presign_supported,

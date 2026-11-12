@@ -661,6 +661,9 @@ async fn capabilities_report_the_file_backend() {
 async fn capabilities_leave_the_old_behaviour_when_the_backend_is_unknown() {
     // 老证据服务的 /healthz 不报 `objects`：不能因此把签名路径判死，
     // 否则切回 s3 的部署反而读不了正文。
+    // 0.3.0 起口径改了：只有**明确报了 `s3`** 才声明可签名——
+    // 多客户部署可能是 `mixed`（部分客户在本地目录），判宽了页面会先吃一个 501；
+    // 而 `file` / `mixed` / 不知道 都能被 BFF 代理读出来（`/api/evidence/{id}/content`）。
     let base = spawn_stub_with_healthz(json!({ "status": "ok" })).await;
     let app = api::router(state(config(base, AuthMode::Ingress)));
     let request = Request::builder()
@@ -671,7 +674,60 @@ async fn capabilities_leave_the_old_behaviour_when_the_backend_is_unknown() {
     let (status, body) = call(&app, request).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert!(body["objects_kind"].is_null(), "{body}");
-    assert_eq!(body["presign_supported"], true, "{body}");
+    assert_eq!(body["presign_supported"], false, "{body}");
+}
+
+#[tokio::test]
+async fn capabilities_report_mixed_backends_as_not_signable() {
+    // 多客户站点：至少一个客户在本地目录上，签名一定签不出来。
+    let base = spawn_stub_with_healthz(json!({
+        "status": "ok",
+        "objects": { "kind": "mixed" },
+        "cells": [{ "cust_id": "c-001", "index": "postgres", "objects": "file" }],
+    }))
+    .await;
+    let app = api::router(state(config(base, AuthMode::Ingress)));
+    let request = Request::builder()
+        .uri("/api/evidence/capabilities")
+        .header("x-console-operator", "zhangsan")
+        .body(Body::empty())
+        .unwrap();
+    let (status, body) = call(&app, request).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["objects_kind"], "mixed", "{body}");
+    assert_eq!(body["presign_supported"], false, "{body}");
+}
+
+#[tokio::test]
+async fn healthz_echoes_the_customer_manifest() {
+    // `/healthz` 是运维第一眼看的地方：多客户站点的故障大多是「客户集合不对」，
+    // 所以这里必须把启动时读到的清单露出来（只报 id 与模式，不报地址）。
+    let base = spawn_stub().await;
+    let app = api::router(state(config_with_tenants(
+        base,
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    )));
+    let (status, body) = call(
+        &app,
+        Request::builder()
+            .uri("/healthz")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["status"], "ok");
+    assert_eq!(body["customers"]["mode"], "multi", "{body}");
+    assert_eq!(
+        body["customers"]["ids"],
+        json!(["t-001", "t-002"]),
+        "{body}"
+    );
+    assert_eq!(body["auth"], "ingress", "{body}");
+    // 默认租户是服务端兜底，不外露（与 `/api/session` 同一条纪律）。
+    assert!(body.get("default_tenant").is_none(), "{body}");
 }
 
 #[tokio::test]
