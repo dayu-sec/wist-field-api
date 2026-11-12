@@ -468,19 +468,24 @@ async fn get_evidence_content(
     }
 }
 
-/// 资产拓扑读接口的代理：`GET /api/atlas/hosts` → `{atlas.base_url}/hosts`。
+/// 资产拓扑读接口的代理：`GET /api/atlas/hosts?tenant=c-a` → `{atlas.base_url}/api/hosts?tenant=c-a`。
 ///
 /// 为什么放在 BFF 而不是让 nginx 直连 atlas：`/atlas/` 里的前端是 iframe，它拿不到
-/// 我们塞在 JS 里的令牌；把它收到 BFF 后面，鉴权就只有一条路（`require_operator`）。
+/// 我们塞在 JS 里的令牌；把它收到 BFF 后面，鉴权就只有一条路（`require_principal`）。
+///
+/// 多客户：atlas 0.4 起读接口按 `?tenant=<cust_id>` 选库。这里用**与证据同一套**
+/// 校验（400 `tenant_required` / 403 `tenant_not_allowed`），然后把**自己校验过的**
+/// 客户追加给上游 —— 浏览器传的值不直接透传（漏一个就是越权）。
 async fn proxy_atlas(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(rest): Path<String>,
     RawQuery(query): RawQuery,
 ) -> Response {
-    if let Err(err) = require_operator(&state, &headers) {
-        return err.into_response();
-    }
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
     let Some(atlas) = state.config.atlas.as_ref() else {
         return error_response(
             StatusCode::NOT_FOUND,
@@ -488,17 +493,6 @@ async fn proxy_atlas(
             "this service has no atlas.base_url configured",
         );
     };
-
-    // atlas 尚未按客户隔离（docs/multi-customer.md §5.7）：多客户站点直接关掉。
-    // 现在它是“看着能用、实际跨客户可见”—— 这种半可用状态比坏掉更危险，
-    // 与“页面能开但永远 401”同一类问题。单客户站点不受影响。
-    if state.config.evidence.allowed_tenants.len() > 1 {
-        return error_response(
-            StatusCode::NOT_IMPLEMENTED,
-            "atlas_not_multi_tenant",
-            "atlas is not tenant-isolated yet; asset topology is disabled on multi-customer sites",
-        );
-    }
     // 写端点与路径穿越都不放行：这里只代理 atlas 的公开读接口。
     let rest = rest.trim_start_matches('/');
     if rest.is_empty() || rest.contains("..") || rest.contains("//") || rest.starts_with("internal")
@@ -510,19 +504,24 @@ async fn proxy_atlas(
         );
     }
 
+    // 选定本次客户：多客户站点必须显式带 `?tenant=`（与证据同一个出口，同一种错误码）。
+    let tenant = match tenant_from_query(&state, &principal, query.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
+    // `tenant` 是 BFF 的“选”，不是上游的过滤条件：先摘掉浏览器传的，再补上校验过的那个。
+    let (_, rest_query) = split_tenant(query.as_deref().unwrap_or(""));
+
     // atlas 的读接口都在 `/api/*` 下（写端点是 `/internal/atlas`）。
-    // 前端看到的是 `/atlas/api/hosts`，到这里剩下 `hosts`，补回 `/api` 才是 atlas 的路径。
-    //
-    // ⚠️ **多客户未隔离（已知缺口，M2 之后处理）**：atlas 的租户是独立的 UUID，
-    // 与证据的 `cust_id` 不同源，且它的读接口目前不按租户过滤 —— 所以这条代理
-    // **不注入客户**。多客户站点若启用资产拓扑，必须单独给 atlas 做租户对齐，
-    // 否则任何持令牌的人都能看到全部客户的拓扑（`tests/contract.rs` 里有一条
-    // 锁定当前行为的用例，避免它被误认为已隔离）。
+    // 前端看到的是 `/api/atlas/hosts`，到这里剩下 `hosts`，补回 `/api` 才是 atlas 的路径。
     let mut url = format!("{}/api/{rest}", atlas.base_url.trim_end_matches('/'));
-    if let Some(query) = query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
-        url.push('?');
-        url.push_str(query);
+    let mut parts: Vec<String> = Vec::new();
+    if !rest_query.is_empty() {
+        parts.push(rest_query);
     }
+    parts.push(format!("tenant={}", urlencode_component(&tenant)));
+    url.push('?');
+    url.push_str(&parts.join("&"));
 
     // atlas 从 0.3.4 起读接口要令牌；BFF 是唯一该拿到它的调用方。
     let mut request = state.http.get(&url);
@@ -723,6 +722,23 @@ fn valid_evidence_key(raw: &str) -> Option<&str> {
         return None;
     }
     Some(trimmed)
+}
+
+/// 百分号编码一个 query 值（RFC 3986 unreserved 以外的字节都转义）。
+///
+/// 为什么不用现成 crate：只需要编码一个短字符串，引入依赖不值当；
+/// 不编码的话客户号里一旦有 `&` / `=` / 空格，拼出来的 URL 就变味了。
+fn urlencode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
 }
 
 /// 租户参数从 query 里拆出来：**先拆、再校验**，绝不直接把浏览器传的值转给证据服务。

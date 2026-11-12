@@ -196,9 +196,16 @@ async fn spawn_stub_with_healthz(healthz_body: Value) -> String {
         .route("/api/v1/query", get(stub_vm_query))
         .route("/api/v1/query_range", get(stub_vm_range))
         // atlas 的读接口（console 以 `/api/atlas/*` 代理过去）。
+        // 把收到的 query 原样回显，用例才能断言 BFF 究竟转了什么给上游。
         .route(
             "/api/hosts",
-            get(|| async { axum::Json(json!({ "status": "ok", "data": { "hosts": [] } })) }),
+            get(|RawQuery(query): RawQuery| async move {
+                axum::Json(json!({
+                    "status": "ok",
+                    "data": { "hosts": [] },
+                    "seenQuery": query,
+                }))
+            }),
         )
         .route("/internal/evidence", get(stub_list))
         .route(
@@ -1345,9 +1352,38 @@ async fn a_tenant_is_required_on_every_read_path_not_only_the_list() {
 }
 
 #[tokio::test]
-async fn atlas_is_refused_on_multi_tenant_sites() {
-    // atlas 的租户是独立 UUID，读接口也还不按客户过滤（docs/multi-customer.md §5.7）。
-    // 多客户站点必须**显式失效**：否则是“看着能用、实际跨客户可见”的半可用状态。
+async fn atlas_proxy_forwards_the_validated_tenant() {
+    // 多客户站点：浏览器（或 atlas 组件）带 `?tenant=`，BFF 校验后用**自己的**值转发上游；
+    // 其它 query 参数原样保留。
+    let base = spawn_stub().await;
+    let mut cfg = config_with_tenants(
+        base.clone(),
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    );
+    cfg.atlas = Some(AtlasConfig {
+        base_url: base,
+        auth_token: None,
+        sink_url: None,
+    });
+    let app = api::router(state(cfg));
+
+    let (status, body) = call(
+        &app,
+        operator_get("/api/atlas/hosts?tenant=t-002&include_stale=true"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let seen = body["seenQuery"].as_str().unwrap_or_default();
+    assert!(seen.contains("tenant=t-002"), "{seen}");
+    assert!(seen.contains("include_stale=true"), "{seen}");
+    // `tenant` 只能出现一次：先摘掉再补，不能既透传又补。
+    assert_eq!(seen.matches("tenant=").count(), 1, "{seen}");
+}
+
+#[tokio::test]
+async fn atlas_proxy_requires_a_tenant_on_multi_customer_sites() {
     let base = spawn_stub().await;
     let mut cfg = config_with_tenants(
         base.clone(),
@@ -1363,16 +1399,40 @@ async fn atlas_is_refused_on_multi_tenant_sites() {
     let app = api::router(state(cfg));
 
     let (status, body) = call(&app, operator_get("/api/atlas/hosts")).await;
-    assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{body}");
-    assert_eq!(body["error"]["code"], "atlas_not_multi_tenant");
-    // 失效提示不回显客户 id：客户清单本身也是信息。
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(body["error"]["code"], "tenant_required");
+}
+
+#[tokio::test]
+async fn atlas_proxy_rejects_a_tenant_outside_the_set() {
+    let base = spawn_stub().await;
+    let mut cfg = config_with_tenants(
+        base.clone(),
+        AuthMode::Ingress,
+        Some("t-001"),
+        &["t-001", "t-002"],
+    );
+    cfg.atlas = Some(AtlasConfig {
+        base_url: base,
+        auth_token: None,
+        sink_url: None,
+    });
+    let app = api::router(state(cfg));
+
+    let (status, body) = call(
+        &app,
+        operator_get("/api/atlas/hosts?tenant=secret-customer"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert_eq!(body["error"]["code"], "tenant_not_allowed");
     let text = body.to_string();
     assert!(!text.contains("t-001") && !text.contains("t-002"), "{text}");
 }
 
 #[tokio::test]
 async fn atlas_proxy_still_works_with_a_single_customer() {
-    // 单客户站点（含“白名单里只有一个客户”的站点）不受这条闸门影响。
+    // 单客户站点（含“白名单里只有一个客户”的站点）不需要显式选客户。
     let base = spawn_stub().await;
     let mut cfg = config_with_tenants(base.clone(), AuthMode::Ingress, Some("t-001"), &["t-001"]);
     cfg.atlas = Some(AtlasConfig {
@@ -1384,4 +1444,12 @@ async fn atlas_proxy_still_works_with_a_single_customer() {
 
     let (status, body) = call(&app, operator_get("/api/atlas/hosts")).await;
     assert_eq!(status, StatusCode::OK, "{body}");
+    // 上游仍会看到 `tenant=`（单客户自动选中那一个）。
+    assert!(
+        body["seenQuery"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("tenant=t-001"),
+        "{body}"
+    );
 }
