@@ -59,6 +59,10 @@ pub fn router(state: AppState) -> Router {
             "/api/metrics/agents/{agent_id}/history",
             get(metrics::agent_history),
         )
+        // 一屏主机的三条走势（主机卡上的迷你图）。按 agent 单查会变成 N 个请求。
+        .route("/api/metrics/hosts/history", get(metrics::hosts_history))
+        // 中间件各家族的当前读数（Kafka broker / 消费积压；DB 家族无数据时也列出来）。
+        .route("/api/metrics/middleware", get(metrics::middleware))
         // 资产拓扑的数据面走 BFF：atlas-web 在 `/atlas/` 里发起的 `/atlas/api/...` 被反代到这里，
         // 所以令牌校验与其它 `/api/*` 是同一道门（不再从 nginx 直连 atlas）。
         // 只放 GET：atlas 的写端点是同一监听的 `/internal/atlas`（POST），浏览器不该碰得到。
@@ -162,8 +166,42 @@ async fn healthz(State(state): State<AppState>) -> Json<serde_json::Value> {
 #[derive(serde::Serialize)]
 struct Health {
     status: &'static str,
+    /// 本服务（wist-field-api）的构建版本。页面左下角要能看出「跑的是哪一版」。
+    version: &'static str,
+    /// 站点栈（wist-field-stack）的版本：由 compose 把栈根 `version.txt` 只读挂进来
+    /// （`/config/stack-version.txt`），或直接给 `WIST_FIELD_STACK_VERSION`。
+    /// 读不到就是 null，页面显示「—」，不编一个假值。
+    stack_version: Option<String>,
     sources: serde_json::Value,
     interfaces: serde_json::Value,
+}
+
+/// 直接给全栈版本的环境变量（优先于文件）。
+const STACK_VERSION_ENV: &str = "WIST_FIELD_STACK_VERSION";
+/// 指定全栈版本文件路径的环境变量。
+const STACK_VERSION_FILE_ENV: &str = "WIST_FIELD_STACK_VERSION_FILE";
+/// 默认挂载点：栈的 `version.txt` 由 compose 只读挂到这里（与 center-stack 同口径）。
+const DEFAULT_STACK_VERSION_FILE: &str = "/config/stack-version.txt";
+
+/// 运行期解析全栈版本：环境变量优先，其次读文件；空串一律当「没有」。
+fn stack_version() -> Option<String> {
+    let env_value = std::env::var(STACK_VERSION_ENV).ok();
+    let path = std::env::var(STACK_VERSION_FILE_ENV)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_STACK_VERSION_FILE.to_string());
+    let file_value = std::fs::read_to_string(std::path::Path::new(path.trim())).ok();
+    resolve_stack_version(env_value.as_deref(), file_value.as_deref())
+}
+
+/// 纯函数形式的取值规则（便于测试）：先环境变量、后文件；trim 后为空则跳过。
+fn resolve_stack_version(env_value: Option<&str>, file_value: Option<&str>) -> Option<String> {
+    [env_value, file_value]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .find(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
@@ -227,6 +265,8 @@ async fn health(State(state): State<AppState>, headers: HeaderMap) -> Response {
 
     Json(Health {
         status: "ok",
+        version: env!("CARGO_PKG_VERSION"),
+        stack_version: stack_version(),
         interfaces: json!(interfaces),
         sources: json!({
             "evidence": evidence,
@@ -1154,4 +1194,36 @@ pub(crate) fn error_response(
         Json(json!({ "error": { "code": code, "message": message.into() } })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod stack_version_tests {
+    use super::resolve_stack_version;
+
+    #[test]
+    fn env_wins_over_file() {
+        assert_eq!(
+            resolve_stack_version(Some(" 0.2.7 \n"), Some("0.2.6")),
+            Some("0.2.7".to_string())
+        );
+    }
+
+    #[test]
+    fn falls_back_to_file() {
+        assert_eq!(
+            resolve_stack_version(None, Some("0.2.7\n")),
+            Some("0.2.7".to_string())
+        );
+        // 环境变量给了但是空的 → 继续看文件。
+        assert_eq!(
+            resolve_stack_version(Some("   "), Some("0.2.7")),
+            Some("0.2.7".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_everywhere_is_none() {
+        assert_eq!(resolve_stack_version(None, None), None);
+        assert_eq!(resolve_stack_version(Some("  "), Some("\n")), None);
+    }
 }

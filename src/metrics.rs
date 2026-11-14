@@ -161,6 +161,55 @@ pub struct AgentHistory {
     pub series: Vec<HistorySeries>,
 }
 
+/// 单台 agent 的趋势：一屏主机不需要这么细（每台三条线，每台都发 2000 点会把响应撑大）。
+const HOSTS_HISTORY_MAX_POINTS: usize = 120;
+
+#[derive(Debug, Serialize)]
+pub struct HostsHistory {
+    pub window_seconds: i64,
+    pub step_seconds: i64,
+    /// agent_id → 三条走势。没有数据的主机不会出现（页面回退到瞬时条）。
+    pub hosts: BTreeMap<String, HostHistory>,
+}
+
+#[derive(Debug, Default, Serialize)]
+pub struct HostHistory {
+    /// 1 分钟负载（**原始值**：卡上按核数折算成利用率）。
+    pub load_1m: Vec<(i64, f64)>,
+    /// 内存使用率（0..1）。
+    pub memory_usage: Vec<(i64, f64)>,
+    /// 系统盘使用率（0..1）。
+    pub disk_usage: Vec<(i64, f64)>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct Middleware {
+    pub families: Vec<MiddlewareFamily>,
+}
+
+/// 中间件的一层（家族）：契约里认识的那几家都列出来，没数据的 `metrics` 为空。
+///
+/// 为什么不由后端拼成「broker 卡 / 积压表」：布局是页面的事，而后端只需要把
+/// 「哪些家族、哪些序列、当前值」说清楚。接口里 `instance` / `state` / `group` / `topic`
+/// 这些 label 原样带出，前端按 `instance` 透视就行。
+#[derive(Debug, Serialize)]
+pub struct MiddlewareFamily {
+    /// 契约里的家族名：`kafka` / `mysql` / `pg` / `doris` / `container`。
+    pub kind: &'static str,
+    pub label: &'static str,
+    /// 指标名前缀（与 `wist-metrics` 的 collection_kind 同名）。
+    pub prefix: &'static str,
+    pub metrics: Vec<MiddlewareSample>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MiddlewareSample {
+    pub metric: String,
+    pub value: f64,
+    /// 序列 label（已去掉 `tenant_id`）：`instance` / `state` / `group` / `topic` / `agent`。
+    pub labels: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct HistoryQuery {
     window_seconds: Option<i64>,
@@ -191,6 +240,129 @@ pub async fn overview(
         Ok(value) => Json(value).into_response(),
         Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
     }
+}
+
+/// `GET /api/metrics/hosts/history?window_seconds=&step_seconds=` — **一屏主机**的三条走势。
+///
+/// 主机卡上要的是「形状」而不是只有瞬时值；按 agent 单查的话，13 台就是 13 个请求、
+/// 每 30 秒一轮，所以卡片以前只能放当前值。这里用 `by (agent)` 的 range 查询，
+/// 一条查询覆盖全队（三条：负载 / 内存 / 系统盘），与 `/api/metrics` 同租户、同口径。
+///
+/// 单位不在这里换算：负载给原始值（卡上按核数折算），内存/磁盘给 0..1 的比例
+/// （与存储里的指标同口径，前端统一乘 100）。
+pub async fn hosts_history(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<HistoryQuery>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, raw.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
+    let Some(config) = metrics_config(&state) else {
+        return not_configured();
+    };
+
+    let (window, step) = history_window(query.window_seconds, query.step_seconds);
+    if let Err(response) = ensure_tenant_label(&state, &state.http, &config).await {
+        return *response;
+    }
+    match collect_hosts_history(&state.http, &config, window, step, &tenant).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
+    }
+}
+
+/// `GET /api/metrics/middleware` — 中间件各家族的当前读数（Kafka / MySQL / PG / Doris / 容器）。
+///
+/// 指标页的「中间件」层不能只列指标名：那几个数字（broker 在不在、分区有没有离线、
+/// 消费积压多少）才是要看的。这里按家族一次查询带回全部序列与当前值，
+/// 布局（broker 卡 / 积压表）留给页面。
+pub async fn middleware(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, raw.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
+    let Some(config) = metrics_config(&state) else {
+        return not_configured();
+    };
+    if let Err(response) = ensure_tenant_label(&state, &state.http, &config).await {
+        return *response;
+    }
+    match collect_middleware(&state.http, &config, &tenant).await {
+        Ok(value) => Json(value).into_response(),
+        Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
+    }
+}
+
+/// 契约里认识的中间件家族（`wist-metrics` 的 collection_kind）。
+/// 没数据也列出来：页面要能说「契约在、采集没开」，而不是静默地少一层。
+const MIDDLEWARE_FAMILIES: &[(&str, &str)] = &[
+    ("kafka", "Kafka"),
+    ("mysql", "MySQL / TiDB"),
+    ("pg", "PostgreSQL"),
+    ("doris", "Doris"),
+    ("container", "容器"),
+];
+
+async fn collect_middleware(
+    http: &reqwest::Client,
+    base_url: &str,
+    tenant: &str,
+) -> Result<Middleware, String> {
+    let mut families = Vec::new();
+    for (prefix, label) in MIDDLEWARE_FAMILIES {
+        let expr = format!("{{__name__=~\"{prefix}_.*\"}}");
+        let result = query(http, base_url, &expr, tenant).await?;
+        let mut metrics = Vec::new();
+        for item in &result {
+            let Some(metric) = item["metric"]["__name__"].as_str() else {
+                continue;
+            };
+            let Some(value) = scalar(item) else {
+                continue;
+            };
+            let labels = item["metric"]
+                .as_object()
+                .map(|object| {
+                    object
+                        .iter()
+                        .filter(|(key, _)| {
+                            key.as_str() != "__name__" && key.as_str() != "tenant_id"
+                        })
+                        .filter_map(|(key, value)| {
+                            value.as_str().map(|value| (key.clone(), value.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            metrics.push(MiddlewareSample {
+                metric: metric.to_string(),
+                value,
+                labels,
+            });
+        }
+        families.push(MiddlewareFamily {
+            kind: prefix,
+            label,
+            prefix,
+            metrics,
+        });
+    }
+    Ok(Middleware { families })
 }
 
 /// `GET /api/metrics/agents/{agent_id}/history?window_seconds=&step_seconds=` — 单台 agent 的趋势。
@@ -638,6 +810,69 @@ fn memory_used(host: &HostMetrics) -> Option<f64> {
 /// 趋势图的一行：(fact_key 或指标名, 标题, 单位, 换算)。
 /// 抽出来是为了过 clippy 的 `type_complexity`。
 type SeriesPlan = (&'static str, &'static str, &'static str, fn(f64) -> f64);
+
+/// 一屏主机的三条走势：三条 `by (agent)` 的 range 查询，而不是每台一条。
+///
+/// 只取三个维度（负载 / 内存 / 系统盘）—— 恰好就是卡上那三条读数；
+/// 挂载点不进来（同一条序列里会有多个挂载点，逐台展开会变成 N×M 条）。
+async fn collect_hosts_history(
+    http: &reqwest::Client,
+    base_url: &str,
+    window: i64,
+    step: i64,
+    tenant: &str,
+) -> Result<HostsHistory, String> {
+    let name = |fact: &str| spec_name(fact).unwrap_or(fact).to_string();
+    let load = format!(
+        "avg by ({}) ({{__name__=\"{}\"}})",
+        label::AGENT,
+        name("host.loadavg.1m")
+    );
+    let memory = format!(
+        "avg by ({}) ({{__name__=\"{}\"}})",
+        label::AGENT,
+        name("host.memory.usage_ratio")
+    );
+    let disk = format!(
+        "avg by ({}) ({{__name__=\"{}\", {}=\"system\"}})",
+        label::AGENT,
+        name("host.disk.system.usage_ratio"),
+        label::DISK_ROLE
+    );
+    let (load, memory, disk) = tokio::join!(
+        query_range(http, base_url, &load, tenant, window, step),
+        query_range(http, base_url, &memory, tenant, window, step),
+        query_range(http, base_url, &disk, tenant, window, step),
+    );
+
+    let mut hosts: BTreeMap<String, HostHistory> = BTreeMap::new();
+    insert_by_agent(&mut hosts, &load?, |row| &mut row.load_1m);
+    insert_by_agent(&mut hosts, &memory?, |row| &mut row.memory_usage);
+    insert_by_agent(&mut hosts, &disk?, |row| &mut row.disk_usage);
+
+    Ok(HostsHistory {
+        window_seconds: window,
+        step_seconds: step,
+        hosts,
+    })
+}
+
+/// 按 `agent` label 归行，每条序列只留最后 `HOSTS_HISTORY_MAX_POINTS` 个点。
+fn insert_by_agent<F>(hosts: &mut BTreeMap<String, HostHistory>, result: &[Value], field: F)
+where
+    F: Fn(&mut HostHistory) -> &mut Vec<(i64, f64)>,
+{
+    for item in result {
+        let Some(agent) = item["metric"][label::AGENT].as_str() else {
+            continue;
+        };
+        let mut series = points(item);
+        if series.len() > HOSTS_HISTORY_MAX_POINTS {
+            series.drain(..series.len() - HOSTS_HISTORY_MAX_POINTS);
+        }
+        *field(hosts.entry(agent.to_string()).or_default()) = series;
+    }
+}
 
 async fn collect_history(
     http: &reqwest::Client,

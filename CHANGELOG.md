@@ -1,5 +1,27 @@
 # CHANGELOG
 
+## 0.7.5 · 2026-11-12
+
+- **`/api/health` 回显版本**：`version`（本服务构建版本，`CARGO_PKG_VERSION`）与
+  `stack_version`（站点栈版本）。栈版本与 `wist-center` 同一个口径：环境变量
+  `WIST_FIELD_STACK_VERSION` 优先，其次读 `WIST_FIELD_STACK_VERSION_FILE`
+  （默认 `/config/stack-version.txt`，由 compose 把栈根 `version.txt` 只读挂进来）；
+  两者都没有就返回 null，页面显示「—」，不编一个假值。
+  页面左下角要能直接看出「页面 / 接口 / 栈」跑的是哪一组，不用再进容器 `docker inspect`。
+  同时不动现有字段（`status` / `sources` / `interfaces`），老前端不受影响。
+- **新增 `GET /api/metrics/hosts/history`（一屏主机的三条走势）**：主机卡上原来只有瞬时值，
+  因为按 agent 单查 `/api/metrics/agents/{id}/history` 的话，13 台就是 13 个请求、每 30 秒一轮。
+  新端点用 `avg by (agent)` 的 `query_range` 一条查询覆盖全队，三组：负载 / 内存使用率 /
+  系统盘使用率，按 `agent` 归行，每条序列只留最后 120 个点（响应 ~117 KB / 13 台）。
+  单位不在后端换算：负载是原始值（前端按核数折算），内存/磁盘是 0..1 的比例。
+  鉴权 / 租户 / 未配置 三条口径与 `/api/metrics` 完全一致。
+- **新增 `GET /api/metrics/middleware`（中间件层读数）**：按家族（kafka / mysql / pg / doris /
+  container）各一条 `{__name__=~"<prefix>_.*"}` 即时查询，带回**全部序列与当前值**，label
+  原样保留；布局留给页面（broker 卡 / 实例表）。没数据的家族也列出（`metrics: []`），
+  页面才能说「契约在、采集没开」，而不是静默少一层。注意 Kafka 的 `instance` 有两种形状：
+  broker 级是 `kafka:<cluster>:<broker>`，集群级（consumer group / 离线分区）是
+  `kafka:<cluster>`——按 instance 直接分组会把一台 broker 拆成两张卡，页面侧按「节点 + 集群」聚合。
+
 ## 0.7.4 · 2026-11-12
 
 - **预签名能力只认 `s3`**：`/api/evidence/capabilities` 的 `presign_supported` 原来是
