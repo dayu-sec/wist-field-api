@@ -1,5 +1,19 @@
 # CHANGELOG
 
+## 0.7.6 · 2026-11-15
+
+- **新增 `GET /api/ingest/stats`（数据面「有没有进来、进来多少」）**：概览页原来只有四个域的
+  **探活**（端点通不通），但「探活 ok」不等于「有数据在进」—— 配置对、上游没发的时候看上去一切正常。
+  这个端点按三条通道报窗口内收到了多少 + 最后一次时间：
+  - **证据** → 调 `wist-evidence` 的 `GET /internal/evidence/stats`（条）；
+  - **Atlas** → 调 `GET /internal/atlas/stats`（行 `ingest_job` = 一批，所以单位是批）；
+  - **运行指标** → 直接问 VictoriaMetrics（`count_over_time` + `last_over_time` 的 `timestamp`，样本）。
+
+  三个单元**故意不统一**（条 / 批 / 样本）：强行折算成一种单位只能靠编，
+  而页面要回答的只是「在不在进、大概多少」。服务还没给端点时返回 `note`（不报 500、
+  不自己翻页凑数、也不去读别人的库），页面把缺什么直接写在那一行下面。
+  需要 `wist-evidence ≥ 0.3.1` / `wist-atlas ≥ 0.7.1` 才会真的出数；没升也安全（`received` 为 null）。
+
 ## 0.7.5 · 2026-11-12
 
 - **`/api/health` 回显版本**：`version`（本服务构建版本，`CARGO_PKG_VERSION`）与

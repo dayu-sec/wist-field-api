@@ -278,6 +278,197 @@ pub async fn hosts_history(
     }
 }
 
+/// 一屏主机的三条走势（主机卡上的迷你图）。按 agent 单查会变成 N 个请求。
+///
+/// ## 一条通道收到了多少
+///
+/// 三条通道的单元本来就不一样：**证据按条**、**Atlas 按投递批次**（`ingest_job` 一行
+/// 就是一次投递）、**指标按样本**。这里照原样报 `unit`，**不做单位换算** ——
+/// 强行统一成一种单位只能靠编。
+///
+/// 为什么不由 BFF 自己算：证据 / Atlas 的准确条数在它们各自的服务里（索引表 / 投递表），
+/// 让 BFF 去翻页凑或直读别人的库，都是“看着对、量大了就错”。
+/// 服务还没提供端点时就把 `note` 带回去，页面上显示得出来缺什么。
+#[derive(Debug, Serialize)]
+pub struct IngestChannel {
+    /// `evidence` / `atlas` / `metrics`。
+    pub id: &'static str,
+    pub label: &'static str,
+    /// 计数单位（`条` / `批` / `样本`）。
+    pub unit: &'static str,
+    /// 窗口内收到的量；`None` = 没拿到（见 `note`）。
+    pub received: Option<f64>,
+    /// 最后一次接收时间（unix 毫秒）。
+    pub last_at_ms: Option<i64>,
+    /// 拿不到的原因（只有 `received` 为 `None` 时给）。
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IngestStats {
+    pub window_seconds: i64,
+    pub checked_at_ms: i64,
+    pub channels: Vec<IngestChannel>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IngestQuery {
+    window_seconds: Option<i64>,
+}
+
+/// `GET /api/ingest/stats?window_seconds=` — 数据有没有进来、进来多少。
+///
+/// 与“接口可用性”的区别：探活 ok 只说明**端点通**，不代表**有数据在进来**。
+/// 两件事在页面上必须分开摆，否则“配置对、上游没发”会看起来一切正常。
+pub async fn ingest_stats(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<IngestQuery>,
+    RawQuery(raw): RawQuery,
+) -> Response {
+    let principal = match authorize_principal(&state, &headers) {
+        Ok(principal) => principal,
+        Err(response) => return *response,
+    };
+    let tenant = match tenant_from_query(&state, &principal, raw.as_deref()) {
+        Ok(tenant) => tenant,
+        Err(err) => return tenant_error(err),
+    };
+    let window = query
+        .window_seconds
+        .unwrap_or(3_600)
+        .clamp(MIN_WINDOW_SECONDS, MAX_WINDOW_SECONDS);
+
+    let evidence = evidence_ingest(&state, &tenant, window).await;
+    let atlas = atlas_ingest(&state, &tenant, window).await;
+    let metrics = metrics_ingest(&state, &tenant, window).await;
+
+    Json(IngestStats {
+        window_seconds: window,
+        checked_at_ms: now_ms() as i64,
+        channels: vec![evidence, atlas, metrics],
+    })
+    .into_response()
+}
+
+/// 证据：服务端的 `/internal/evidence/stats`（`{received, last_at_ms}`）。
+async fn evidence_ingest(state: &AppState, tenant: &str, window: i64) -> IngestChannel {
+    let mut channel = IngestChannel {
+        id: "evidence",
+        label: "证据",
+        unit: "条",
+        received: None,
+        last_at_ms: None,
+        note: None,
+    };
+    match state.evidence.stats(tenant, window).await {
+        Ok(response) if response.status.is_success() => {
+            let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+            channel.received = body["received"].as_f64();
+            channel.last_at_ms = body["last_at_ms"].as_i64();
+            if channel.received.is_none() {
+                channel.note = Some("证据服务返回的计数为空".to_string());
+            }
+        }
+        Ok(response) => {
+            channel.note = Some(if response.status == StatusCode::NOT_FOUND {
+                "证据服务还没有计数端点 /internal/evidence/stats（服务发版后这一行自动有数）"
+                    .to_string()
+            } else {
+                format!("证据服务返回 {}", response.status.as_u16())
+            });
+        }
+        Err(err) => channel.note = Some(format!("证据服务不可达：{err}")),
+    }
+    channel
+}
+
+/// Atlas：`/internal/atlas/stats`（`{received, last_at_ms}`，一行 `ingest_job` = 一批）。
+async fn atlas_ingest(state: &AppState, tenant: &str, window: i64) -> IngestChannel {
+    let mut channel = IngestChannel {
+        id: "atlas",
+        label: "Atlas",
+        unit: "批",
+        received: None,
+        last_at_ms: None,
+        note: None,
+    };
+    let Some(atlas) = state.config.atlas.as_ref() else {
+        channel.note = Some("BFF 没配 [atlas]".to_string());
+        return channel;
+    };
+    let url = format!(
+        "{}/internal/atlas/stats?window_seconds={window}&tenant={tenant}",
+        atlas.base_url.trim_end_matches('/')
+    );
+    let mut request = state.http.get(&url);
+    if let Some(token) = atlas.auth_token.as_deref() {
+        request = request.bearer_auth(token);
+    }
+    match request.send().await {
+        Ok(response) if response.status().is_success() => {
+            let body: Value = response.json().await.unwrap_or(Value::Null);
+            channel.received = body["received"].as_f64();
+            channel.last_at_ms = body["last_at_ms"].as_i64();
+            if channel.received.is_none() {
+                channel.note = Some("Atlas 返回的计数为空".to_string());
+            }
+        }
+        Ok(response) => {
+            channel.note = Some(if response.status() == StatusCode::NOT_FOUND {
+                "Atlas 还没有计数端点 /internal/atlas/stats（服务发版后这一行自动有数）".to_string()
+            } else {
+                format!("Atlas 返回 {}", response.status().as_u16())
+            });
+        }
+        Err(err) => channel.note = Some(format!("Atlas 不可达：{err}")),
+    }
+    channel
+}
+
+/// 指标：VM 自己就能回答（窗口内样本数 + 最后一条样本时间），不需要服务改动。
+async fn metrics_ingest(state: &AppState, tenant: &str, window: i64) -> IngestChannel {
+    let mut channel = IngestChannel {
+        id: "metrics",
+        label: "运行指标",
+        unit: "样本",
+        received: None,
+        last_at_ms: None,
+        note: None,
+    };
+    let Some(config) = metrics_config(state) else {
+        channel.note = Some("BFF 没配 [metrics]".to_string());
+        return channel;
+    };
+    if !tenant.is_empty()
+        && state.config.evidence.allowed_tenants.len() > 1
+        && ensure_tenant_label(state, &state.http, &config)
+            .await
+            .is_err()
+    {
+        channel.note = Some("指标里没有 tenant_id label，无法按客户隔离查询".to_string());
+        return channel;
+    }
+    let samples = format!("sum(count_over_time({{__name__!=\"\"}}[{window}s]))");
+    let last = format!("max(timestamp(last_over_time({{__name__!=\"\"}}[{window}s])))");
+    match query(&state.http, &config, &samples, tenant).await {
+        Ok(result) => channel.received = result.first().and_then(scalar),
+        Err(err) => channel.note = Some(format!("指标存储查询失败：{err}")),
+    }
+    match query(&state.http, &config, &last, tenant).await {
+        // `timestamp()` 给的是秒，页面用毫秒。
+        Ok(result) => {
+            channel.last_at_ms = result.first().and_then(scalar).map(|s| (s * 1000.0) as i64)
+        }
+        Err(err) => {
+            channel
+                .note
+                .get_or_insert(format!("指标存储查询失败：{err}"));
+        }
+    }
+    channel
+}
+
 /// `GET /api/metrics/middleware` — 中间件各家族的当前读数（Kafka / MySQL / PG / Doris / 容器）。
 ///
 /// 指标页的「中间件」层不能只列指标名：那几个数字（broker 在不在、分区有没有离线、

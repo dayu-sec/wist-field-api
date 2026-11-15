@@ -92,6 +92,19 @@ impl EvidenceClient {
             .await
     }
 
+    /// 窗口内的接收计数（看板用）：`{received, last_stored_at}`。
+    ///
+    /// 证据服务的 0.3.x 还没有这个端点（会 404）。BFF 不自己拼（翻页计数对不住量），
+    /// 也不去读它的库（跨服务读表比没数字更坑）—— 拿不到就把 `note` 带回去。
+    pub async fn stats(
+        &self,
+        tenant: &str,
+        window_seconds: i64,
+    ) -> Result<UpstreamResponse, String> {
+        let path = format!("/internal/evidence/stats?window_seconds={window_seconds}");
+        self.send(Method::GET, &path, tenant).await
+    }
+
     pub async fn get(&self, tenant: &str, key: &str) -> Result<UpstreamResponse, String> {
         self.send(Method::GET, &format!("/internal/evidence/{key}"), tenant)
             .await
