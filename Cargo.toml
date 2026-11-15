@@ -41,4 +41,4 @@ http-body-util = "0.1"
 tower = { version = "0.5", features = ["util"] }
 # 测试里要造一套真的 mTLS 材料（CA 签的服务器证书 + 私钥），
 # 不然「材料齐备 → 启动即就绪」这条路径测不到。
-rcgen = { version = "0.13", features = ["pem"] }
+rcgen = { version = "0.14", features = ["pem"] }
