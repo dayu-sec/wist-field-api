@@ -53,14 +53,8 @@ pub fn router(state: AppState) -> Router {
         // **不返回默认客户**：不在前端猜一个默认值（那类退化是看错客户的来源）。
         .route("/api/session", get(session))
         // 运行指标：读计算区自己那份 VictoriaMetrics（数据面镜像写进来的）。
-        // 概览 + 单台 agent 的趋势；两个都只读，不做跨栈聚合。
+        // 概览只读，不做跨栈聚合。
         .route("/api/metrics", get(metrics::overview))
-        .route(
-            "/api/metrics/agents/{agent_id}/history",
-            get(metrics::agent_history),
-        )
-        // 一屏主机的三条走势（主机卡上的迷你图）。按 agent 单查会变成 N 个请求。
-        .route("/api/metrics/hosts/history", get(metrics::hosts_history))
         // 中间件各家族的当前读数（Kafka broker / 消费积压；DB 家族无数据时也列出来）。
         .route("/api/metrics/middleware", get(metrics::middleware))
         // 数据面三条通道「有没有进来、进来多少」（与探活分开：通 ≠ 有数据）。

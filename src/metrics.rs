@@ -17,7 +17,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use axum::Json;
-use axum::extract::{Path, Query, RawQuery, State};
+use axum::extract::{Query, RawQuery, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde::{Deserialize, Serialize};
@@ -35,14 +35,10 @@ const SAMPLE_WINDOW_SECONDS: i64 = 300;
 /// 单次查询超时。VM 就在栈内网，慢到这个程度说明它自己有问题。
 const QUERY_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// 趋势窗口与步长的上下界（秒）：页面给几个档，但不接受任意值 —— `[1s]` 这种
-/// 步长会把 VM 抽干，`[7d]` 这种窗口又会把响应撑到几 MB。
+/// 窗口的上界：看板允许「近 N 分钟」这种自定义窗口，但不接受任意值 ——
+/// `[7d]` 这种窗口会把响应撑到几 MB。
 const MIN_WINDOW_SECONDS: i64 = 300;
 const MAX_WINDOW_SECONDS: i64 = 86_400;
-const MIN_STEP_SECONDS: i64 = 10;
-const MAX_STEP_SECONDS: i64 = 900;
-/// 单个序列最多取多少个点（VM 默认上限 10k，这里留足余量又不让响应过大）。
-const MAX_POINTS: i64 = 2_000;
 
 /// 选择类 label（由网关下发、贴在全部序列上）。只有这些算「这台 agent 的身份」；
 /// `target_kind` / `outcome` 之类是**某条指标自己的**属性，混进身份会让同一台机器裂成多行。
@@ -141,48 +137,6 @@ pub struct BusinessRow {
 }
 
 #[derive(Debug, Serialize)]
-pub struct HistorySeries {
-    /// 规范指标名（`agent_cpu_ratio` …），只用于排查，页面标题看 `title`。
-    pub metric: String,
-    /// 页面标题：由后端按常量表给出，前端不再自己认名字。
-    pub title: &'static str,
-    /// 页面口径：`percent` / `bytes` / `count` / `milliseconds`。
-    pub unit: &'static str,
-    /// `(unix 毫秒, 值)`，按时间升序。
-    pub points: Vec<(i64, f64)>,
-}
-
-#[derive(Debug, Serialize)]
-pub struct AgentHistory {
-    pub agent_id: String,
-    pub window_seconds: i64,
-    pub step_seconds: i64,
-    pub labels: BTreeMap<String, String>,
-    pub series: Vec<HistorySeries>,
-}
-
-/// 单台 agent 的趋势：一屏主机不需要这么细（每台三条线，每台都发 2000 点会把响应撑大）。
-const HOSTS_HISTORY_MAX_POINTS: usize = 120;
-
-#[derive(Debug, Serialize)]
-pub struct HostsHistory {
-    pub window_seconds: i64,
-    pub step_seconds: i64,
-    /// agent_id → 三条走势。没有数据的主机不会出现（页面回退到瞬时条）。
-    pub hosts: BTreeMap<String, HostHistory>,
-}
-
-#[derive(Debug, Default, Serialize)]
-pub struct HostHistory {
-    /// 1 分钟负载（**原始值**：卡上按核数折算成利用率）。
-    pub load_1m: Vec<(i64, f64)>,
-    /// 内存使用率（0..1）。
-    pub memory_usage: Vec<(i64, f64)>,
-    /// 系统盘使用率（0..1）。
-    pub disk_usage: Vec<(i64, f64)>,
-}
-
-#[derive(Debug, Serialize)]
 pub struct Middleware {
     pub families: Vec<MiddlewareFamily>,
 }
@@ -208,12 +162,6 @@ pub struct MiddlewareSample {
     pub value: f64,
     /// 序列 label（已去掉 `tenant_id`）：`instance` / `state` / `group` / `topic` / `agent`。
     pub labels: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct HistoryQuery {
-    window_seconds: Option<i64>,
-    step_seconds: Option<i64>,
 }
 
 /// `GET /api/metrics` — 概览：存储里有什么、谁在报、当前值是多少。
@@ -242,51 +190,13 @@ pub async fn overview(
     }
 }
 
-/// `GET /api/metrics/hosts/history?window_seconds=&step_seconds=` — **一屏主机**的三条走势。
+/// 一条通道「累计写进来多少 + 最后一次是什么时候」。
 ///
-/// 主机卡上要的是「形状」而不是只有瞬时值；按 agent 单查的话，13 台就是 13 个请求、
-/// 每 30 秒一轮，所以卡片以前只能放当前值。这里用 `by (agent)` 的 range 查询，
-/// 一条查询覆盖全队（三条：负载 / 内存 / 系统盘），与 `/api/metrics` 同租户、同口径。
+/// 三条通道的单元本来就不一样：**证据按条**、**Atlas 按快照条数**、**指标按样本**。
+/// 这里照原样报 `unit`，**不做单位换算** —— 强行统一成一种单位只能靠编。
 ///
-/// 单位不在这里换算：负载给原始值（卡上按核数折算），内存/磁盘给 0..1 的比例
-/// （与存储里的指标同口径，前端统一乘 100）。
-pub async fn hosts_history(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Query(query): Query<HistoryQuery>,
-    RawQuery(raw): RawQuery,
-) -> Response {
-    let principal = match authorize_principal(&state, &headers) {
-        Ok(principal) => principal,
-        Err(response) => return *response,
-    };
-    let tenant = match tenant_from_query(&state, &principal, raw.as_deref()) {
-        Ok(tenant) => tenant,
-        Err(err) => return tenant_error(err),
-    };
-    let Some(config) = metrics_config(&state) else {
-        return not_configured();
-    };
-
-    let (window, step) = history_window(query.window_seconds, query.step_seconds);
-    if let Err(response) = ensure_tenant_label(&state, &state.http, &config).await {
-        return *response;
-    }
-    match collect_hosts_history(&state.http, &config, window, step, &tenant).await {
-        Ok(value) => Json(value).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
-    }
-}
-
-/// 一屏主机的三条走势（主机卡上的迷你图）。按 agent 单查会变成 N 个请求。
-///
-/// ## 一条通道收到了多少
-///
-/// 三条通道的单元本来就不一样：**证据按条**、**Atlas 按投递批次**（`ingest_job` 一行
-/// 就是一次投递）、**指标按样本**。这里照原样报 `unit`，**不做单位换算** ——
-/// 强行统一成一种单位只能靠编。
-///
-/// 为什么不由 BFF 自己算：证据 / Atlas 的准确条数在它们各自的服务里（索引表 / 投递表），
+/// 累计量由各服务自己的进程内计数器给（O(1)），所以看板可以秒级轮询；
+/// 为什么不由 BFF 自己算：准确条数在各自的服务里（索引表 / 投递表），
 /// 让 BFF 去翻页凑或直读别人的库，都是“看着对、量大了就错”。
 /// 服务还没提供端点时就把 `note` 带回去，页面上显示得出来缺什么。
 #[derive(Debug, Serialize)]
@@ -294,18 +204,23 @@ pub struct IngestChannel {
     /// `evidence` / `atlas` / `metrics`。
     pub id: &'static str,
     pub label: &'static str,
-    /// 计数单位（`条` / `批` / `样本`）。
+    /// 计数单位（`条` / `样本`）。
     pub unit: &'static str,
-    /// 窗口内收到的量；`None` = 没拿到（见 `note`）。
+    /// **累计**写入量（自服务启动时的基线算起，含历史行）。
+    ///
+    /// 走服务端的进程内计数器（O(1)），所以可以秒级轮询；`None` = 这个通道没有累计概念。
+    pub total: Option<f64>,
+    /// 窗口内的量（仅在传了 `window_seconds > 0` 时给）。
     pub received: Option<f64>,
     /// 最后一次接收时间（unix 毫秒）。
     pub last_at_ms: Option<i64>,
-    /// 拿不到的原因（只有 `received` 为 `None` 时给）。
+    /// 拿不到的原因（只有 `total` 与 `received` 都为 `None` 时给）。
     pub note: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct IngestStats {
+    /// 传 0 = 只看累计（看板实时轮询走这条，不触发任何窗口 count）。
     pub window_seconds: i64,
     pub checked_at_ms: i64,
     pub channels: Vec<IngestChannel>,
@@ -334,10 +249,14 @@ pub async fn ingest_stats(
         Ok(tenant) => tenant,
         Err(err) => return tenant_error(err),
     };
-    let window = query
-        .window_seconds
-        .unwrap_or(3_600)
-        .clamp(MIN_WINDOW_SECONDS, MAX_WINDOW_SECONDS);
+    // `window_seconds=0` = 只看累计：看板实时轮询（3 秒）走这条，
+    // 不触发服务端的窗口 count，也不向 VM 发 count_over_time。
+    let requested = query.window_seconds.unwrap_or(0);
+    let window = if requested > 0 {
+        requested.clamp(MIN_WINDOW_SECONDS, MAX_WINDOW_SECONDS)
+    } else {
+        0
+    };
 
     let evidence = evidence_ingest(&state, &tenant, window).await;
     let atlas = atlas_ingest(&state, &tenant, window).await;
@@ -351,12 +270,13 @@ pub async fn ingest_stats(
     .into_response()
 }
 
-/// 证据：服务端的 `/internal/evidence/stats`（`{received, last_at_ms}`）。
+/// 证据：服务端的 `/internal/evidence/stats`（`{total, received, last_at_ms}`）。
 async fn evidence_ingest(state: &AppState, tenant: &str, window: i64) -> IngestChannel {
     let mut channel = IngestChannel {
         id: "evidence",
         label: "证据",
         unit: "条",
+        total: None,
         received: None,
         last_at_ms: None,
         note: None,
@@ -364,9 +284,10 @@ async fn evidence_ingest(state: &AppState, tenant: &str, window: i64) -> IngestC
     match state.evidence.stats(tenant, window).await {
         Ok(response) if response.status.is_success() => {
             let body: Value = serde_json::from_slice(&response.body).unwrap_or(Value::Null);
+            channel.total = body["total"].as_f64();
             channel.received = body["received"].as_f64();
             channel.last_at_ms = body["last_at_ms"].as_i64();
-            if channel.received.is_none() {
+            if channel.total.is_none() && channel.received.is_none() {
                 channel.note = Some("证据服务返回的计数为空".to_string());
             }
         }
@@ -383,12 +304,13 @@ async fn evidence_ingest(state: &AppState, tenant: &str, window: i64) -> IngestC
     channel
 }
 
-/// Atlas：`/internal/atlas/stats`（`{received, last_at_ms}`，一行 `ingest_job` = 一批）。
+/// Atlas：`/internal/atlas/stats`（`{total, received, last_at_ms}`；`ingest_job` 一行 = 一份快照）。
 async fn atlas_ingest(state: &AppState, tenant: &str, window: i64) -> IngestChannel {
     let mut channel = IngestChannel {
         id: "atlas",
         label: "Atlas",
-        unit: "批",
+        unit: "条",
+        total: None,
         received: None,
         last_at_ms: None,
         note: None,
@@ -408,9 +330,10 @@ async fn atlas_ingest(state: &AppState, tenant: &str, window: i64) -> IngestChan
     match request.send().await {
         Ok(response) if response.status().is_success() => {
             let body: Value = response.json().await.unwrap_or(Value::Null);
+            channel.total = body["total"].as_f64();
             channel.received = body["received"].as_f64();
             channel.last_at_ms = body["last_at_ms"].as_i64();
-            if channel.received.is_none() {
+            if channel.total.is_none() && channel.received.is_none() {
                 channel.note = Some("Atlas 返回的计数为空".to_string());
             }
         }
@@ -427,11 +350,15 @@ async fn atlas_ingest(state: &AppState, tenant: &str, window: i64) -> IngestChan
 }
 
 /// 指标：VM 自己就能回答（窗口内样本数 + 最后一条样本时间），不需要服务改动。
+///
+/// 指标没有「累计行数」这个概念（VM 不保存写入了多少行的总账），所以 `total` 恒为 `None`；
+/// 实时模式（`window=0`）只给「最后一次样本时间」，不断言条数。
 async fn metrics_ingest(state: &AppState, tenant: &str, window: i64) -> IngestChannel {
     let mut channel = IngestChannel {
         id: "metrics",
         label: "运行指标",
         unit: "样本",
+        total: None,
         received: None,
         last_at_ms: None,
         note: None,
@@ -449,21 +376,40 @@ async fn metrics_ingest(state: &AppState, tenant: &str, window: i64) -> IngestCh
         channel.note = Some("指标里没有 tenant_id label，无法按客户隔离查询".to_string());
         return channel;
     }
-    let samples = format!("sum(count_over_time({{__name__!=\"\"}}[{window}s]))");
-    let last = format!("max(timestamp(last_over_time({{__name__!=\"\"}}[{window}s])))");
-    match query(&state.http, &config, &samples, tenant).await {
-        Ok(result) => channel.received = result.first().and_then(scalar),
-        Err(err) => channel.note = Some(format!("指标存储查询失败：{err}")),
-    }
-    match query(&state.http, &config, &last, tenant).await {
-        // `timestamp()` 给的是秒，页面用毫秒。
-        Ok(result) => {
-            channel.last_at_ms = result.first().and_then(scalar).map(|s| (s * 1000.0) as i64)
+    if window > 0 {
+        let samples = format!("sum(count_over_time({{__name__!=\"\"}}[{window}s]))");
+        match query(&state.http, &config, &samples, tenant).await {
+            Ok(result) => channel.received = result.first().and_then(scalar),
+            Err(err) => channel.note = Some(format!("指标存储查询失败：{err}")),
         }
-        Err(err) => {
-            channel
-                .note
-                .get_or_insert(format!("指标存储查询失败：{err}"));
+    }
+    // 「最后一次样本」不能写成 `[0s]`（非法 range），也不能用瞬时查询：
+    // 数据源停了以后 VM 会把这些序列标 stale，匹配全部指标的瞬时查询直接返回空，
+    // 于是「三小时前停的」会变成「从来没有过」。所以一律用 `last_over_time`。
+    //
+    // 两段回退：先问 5 分钟（平稳时这一下就中，且按客户过滤后只扫自家的序列）；
+    // 空了再问 1 小时 —— 只有真断了才会走第二段，平时 3 秒轮询不为它付代价。
+    let lookbacks: Vec<String> = if window > 0 {
+        vec![format!("{window}s")]
+    } else {
+        vec!["5m".to_string(), "1h".to_string()]
+    };
+    for lookback in lookbacks {
+        let expr = format!("max(timestamp(last_over_time({{__name__!=\"\"}}[{lookback}])))");
+        match query(&state.http, &config, &expr, tenant).await {
+            // `timestamp()` 给的是秒，页面用毫秒。
+            Ok(result) => {
+                channel.last_at_ms = result.first().and_then(scalar).map(|s| (s * 1000.0) as i64);
+                if channel.last_at_ms.is_some() {
+                    break;
+                }
+            }
+            Err(err) => {
+                channel
+                    .note
+                    .get_or_insert(format!("指标存储查询失败：{err}"));
+                break;
+            }
         }
     }
     channel
@@ -554,36 +500,6 @@ async fn collect_middleware(
         });
     }
     Ok(Middleware { families })
-}
-
-/// `GET /api/metrics/agents/{agent_id}/history?window_seconds=&step_seconds=` — 单台 agent 的趋势。
-pub async fn agent_history(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Path(agent_id): Path<String>,
-    Query(query): Query<HistoryQuery>,
-    RawQuery(raw): RawQuery,
-) -> Response {
-    let principal = match authorize_principal(&state, &headers) {
-        Ok(principal) => principal,
-        Err(response) => return *response,
-    };
-    let tenant = match tenant_from_query(&state, &principal, raw.as_deref()) {
-        Ok(tenant) => tenant,
-        Err(err) => return tenant_error(err),
-    };
-    let Some(config) = metrics_config(&state) else {
-        return not_configured();
-    };
-
-    let (window, step) = history_window(query.window_seconds, query.step_seconds);
-    if let Err(response) = ensure_tenant_label(&state, &state.http, &config).await {
-        return *response;
-    }
-    match collect_history(&state.http, &config, &agent_id, window, step, &tenant).await {
-        Ok(history) => Json(history).into_response(),
-        Err(err) => error_response(StatusCode::BAD_GATEWAY, "metrics_unavailable", err),
-    }
 }
 
 /// 数据面的指标里有没有 `tenant_id` label（按 `base_url` 缓存 60s）。
@@ -998,221 +914,6 @@ fn memory_used(host: &HostMetrics) -> Option<f64> {
     }
 }
 
-/// 趋势图的一行：(fact_key 或指标名, 标题, 单位, 换算)。
-/// 抽出来是为了过 clippy 的 `type_complexity`。
-type SeriesPlan = (&'static str, &'static str, &'static str, fn(f64) -> f64);
-
-/// 一屏主机的三条走势：三条 `by (agent)` 的 range 查询，而不是每台一条。
-///
-/// 只取三个维度（负载 / 内存 / 系统盘）—— 恰好就是卡上那三条读数；
-/// 挂载点不进来（同一条序列里会有多个挂载点，逐台展开会变成 N×M 条）。
-async fn collect_hosts_history(
-    http: &reqwest::Client,
-    base_url: &str,
-    window: i64,
-    step: i64,
-    tenant: &str,
-) -> Result<HostsHistory, String> {
-    let name = |fact: &str| spec_name(fact).unwrap_or(fact).to_string();
-    let load = format!(
-        "avg by ({}) ({{__name__=\"{}\"}})",
-        label::AGENT,
-        name("host.loadavg.1m")
-    );
-    let memory = format!(
-        "avg by ({}) ({{__name__=\"{}\"}})",
-        label::AGENT,
-        name("host.memory.usage_ratio")
-    );
-    let disk = format!(
-        "avg by ({}) ({{__name__=\"{}\", {}=\"system\"}})",
-        label::AGENT,
-        name("host.disk.system.usage_ratio"),
-        label::DISK_ROLE
-    );
-    let (load, memory, disk) = tokio::join!(
-        query_range(http, base_url, &load, tenant, window, step),
-        query_range(http, base_url, &memory, tenant, window, step),
-        query_range(http, base_url, &disk, tenant, window, step),
-    );
-
-    let mut hosts: BTreeMap<String, HostHistory> = BTreeMap::new();
-    insert_by_agent(&mut hosts, &load?, |row| &mut row.load_1m);
-    insert_by_agent(&mut hosts, &memory?, |row| &mut row.memory_usage);
-    insert_by_agent(&mut hosts, &disk?, |row| &mut row.disk_usage);
-
-    Ok(HostsHistory {
-        window_seconds: window,
-        step_seconds: step,
-        hosts,
-    })
-}
-
-/// 按 `agent` label 归行，每条序列只留最后 `HOSTS_HISTORY_MAX_POINTS` 个点。
-fn insert_by_agent<F>(hosts: &mut BTreeMap<String, HostHistory>, result: &[Value], field: F)
-where
-    F: Fn(&mut HostHistory) -> &mut Vec<(i64, f64)>,
-{
-    for item in result {
-        let Some(agent) = item["metric"][label::AGENT].as_str() else {
-            continue;
-        };
-        let mut series = points(item);
-        if series.len() > HOSTS_HISTORY_MAX_POINTS {
-            series.drain(..series.len() - HOSTS_HISTORY_MAX_POINTS);
-        }
-        *field(hosts.entry(agent.to_string()).or_default()) = series;
-    }
-}
-
-async fn collect_history(
-    http: &reqwest::Client,
-    base_url: &str,
-    agent_id: &str,
-    window: i64,
-    step: i64,
-    tenant: &str,
-) -> Result<AgentHistory, String> {
-    let expr = format!(
-        "{{{}=\"{}\", __name__=~\"{}\"}}",
-        label::AGENT,
-        escape_promql(agent_id),
-        agent_metric::HISTORY.join("|")
-    );
-    // 主机侧要 `max by (__name__)`：挂载点会展开成多条序列，图上只要一条（最紧张的那个）。
-    // 磁盘带 `disk_role=system` 过滤，挂载点则没这个 label，所以拆两条。
-    let agent = escape_promql(agent_id);
-    let host_load_mem = format!(
-        "max by (__name__) ({{{}=\"{}\", __name__=~\"{}\"}})",
-        label::AGENT,
-        agent,
-        names_for(&["host.loadavg.1m", "host.memory.usage_ratio"])
-    );
-    let host_disk = format!(
-        "max by (__name__) ({{{}=\"{}\", __name__=~\"{}\", {}=\"system\"}})",
-        label::AGENT,
-        agent,
-        names_for(&["host.disk.system.usage_ratio"]),
-        label::DISK_ROLE
-    );
-    let host_filesystem = format!(
-        "max by (__name__) ({{{}=\"{}\", __name__=~\"{}\"}})",
-        label::AGENT,
-        agent,
-        names_for(&["host.filesystem.usage_ratio"])
-    );
-    let (self_result, load_mem, disk, filesystem) = tokio::join!(
-        query_range(http, base_url, &expr, tenant, window, step),
-        query_range(http, base_url, &host_load_mem, tenant, window, step),
-        query_range(http, base_url, &host_disk, tenant, window, step),
-        query_range(http, base_url, &host_filesystem, tenant, window, step),
-    );
-
-    let mut labels = BTreeMap::new();
-    let mut by_name: BTreeMap<String, Vec<(i64, f64)>> = BTreeMap::new();
-    for result in [self_result?, load_mem?, disk?, filesystem?] {
-        for item in &result {
-            let metric = &item["metric"];
-            if labels.is_empty() {
-                for key in SELECTION_LABELS {
-                    if let Some(found) = metric.get(*key).and_then(Value::as_str) {
-                        labels.insert((*key).to_string(), found.to_string());
-                    }
-                }
-            }
-            let Some(name) = metric["__name__"].as_str() else {
-                continue;
-            };
-            by_name.insert(name.to_string(), points(item));
-        }
-    }
-
-    // 先主机（页面就是为它加的），再 agent 自观测；每张图的名称/单位/换算出后端定。
-    let plan: Vec<SeriesPlan> = vec![
-        ("host.loadavg.1m", "1 分钟负载", "count", |value| value),
-        (
-            "host.memory.usage_ratio",
-            "主机内存使用率",
-            "percent",
-            ratio_to_percent,
-        ),
-        (
-            "host.disk.system.usage_ratio",
-            "系统盘使用率",
-            "percent",
-            ratio_to_percent,
-        ),
-        (
-            "host.filesystem.usage_ratio",
-            "最紧张挂载点使用率",
-            "percent",
-            ratio_to_percent,
-        ),
-        (
-            agent_metric::MEMORY_BYTES,
-            "Agent 常驻内存",
-            "bytes",
-            |value| value,
-        ),
-        (
-            agent_metric::CPU_RATIO,
-            "Agent CPU（单核比例换算）",
-            "percent",
-            ratio_to_percent,
-        ),
-        (
-            agent_metric::CPU_CORES,
-            "Agent 逻辑核数",
-            "count",
-            |value| value,
-        ),
-        (
-            agent_metric::ADMIN_LATENCY_SECONDS,
-            "管理面往返时延",
-            "milliseconds",
-            |value| seconds_to_millis(value) as f64,
-        ),
-    ];
-    let mut series = Vec::new();
-    for (key, title, unit, convert) in plan {
-        // 前四项是 fact_key（主机侧），后四项直接是指标名（agent 自观测）。
-        let name = spec_name(key).unwrap_or(key);
-        let points = by_name.remove(name).unwrap_or_default();
-        if points.is_empty() {
-            continue;
-        }
-        series.push(HistorySeries {
-            metric: name.to_string(),
-            title,
-            unit,
-            points: points
-                .into_iter()
-                .map(|(at, value)| (at, convert(value)))
-                .collect(),
-        });
-    }
-
-    Ok(AgentHistory {
-        agent_id: agent_id.to_string(),
-        window_seconds: window,
-        step_seconds: step,
-        labels,
-        series,
-    })
-}
-
-fn history_window(window: Option<i64>, step: Option<i64>) -> (i64, i64) {
-    let window = window
-        .unwrap_or(3_600)
-        .clamp(MIN_WINDOW_SECONDS, MAX_WINDOW_SECONDS);
-    let mut step = step.unwrap_or(30).clamp(MIN_STEP_SECONDS, MAX_STEP_SECONDS);
-    // 窗口拉长后固定步长会撞上点数上限：按窗口放宽步长，宁可粗一点也不截断曲线。
-    // 用向上取整：`window / MAX_POINTS` 向下取整时点数会略微超限。
-    let floor_step = (window + MAX_POINTS - 1) / MAX_POINTS;
-    step = step.max(floor_step.max(MIN_STEP_SECONDS));
-    (window, step)
-}
-
 /// GET `/api/v1/query`，返回 `data.result`。
 /// 把当前客户拼进 PromQL 的 label selector。
 ///
@@ -1257,38 +958,6 @@ async fn query(
         .unwrap_or_default())
 }
 
-/// GET `/api/v1/query_range`，返回 `data.result`。
-async fn query_range(
-    http: &reqwest::Client,
-    base_url: &str,
-    expr: &str,
-    tenant: &str,
-    window: i64,
-    step: i64,
-) -> Result<Vec<Value>, String> {
-    let url = format!("{base_url}/api/v1/query_range");
-    let now = (now_ms() / 1000) as i64;
-    let start = (now - window).to_string();
-    let end = now.to_string();
-    let step = step.to_string();
-    let scoped = scope_tenant(expr, tenant);
-    let payload = get_json(
-        http,
-        &url,
-        &[
-            ("query", scoped.as_str()),
-            ("start", start.as_str()),
-            ("end", end.as_str()),
-            ("step", step.as_str()),
-        ],
-    )
-    .await?;
-    Ok(payload["data"]["result"]
-        .as_array()
-        .cloned()
-        .unwrap_or_default())
-}
-
 async fn get_json(
     http: &reqwest::Client,
     url: &str,
@@ -1321,31 +990,6 @@ fn scalar(item: &Value) -> Option<f64> {
         .filter(|value| value.is_finite())
 }
 
-/// 区间查询的点列 `[(unix 毫秒, 值)]`，跳过非有限值（VM 的时间序列会带 `NaN`）。
-fn points(item: &Value) -> Vec<(i64, f64)> {
-    item["values"]
-        .as_array()
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|point| {
-                    let pair = point.as_array()?;
-                    let at = pair.first()?.as_f64()?;
-                    let value = pair.get(1)?.as_str()?.parse::<f64>().ok()?;
-                    value
-                        .is_finite()
-                        .then(|| ((at * 1000.0).round() as i64, value))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// PromQL / MetricsQL 字符串字面量转义：`agent` id 来自 URL，不能直接拼进表达式。
-fn escape_promql(value: &str) -> String {
-    value.replace('\\', "\\\\").replace('"', "\\\"")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1362,21 +1006,6 @@ mod tests {
             let name = spec_name(fact).expect("resolved");
             assert_eq!(fact_key(name), Some(*fact), "{fact} → {name} 反查不一致");
         }
-    }
-
-    #[test]
-    fn window_and_step_are_clamped() {
-        assert_eq!(history_window(None, None), (3_600, 30));
-        assert_eq!(history_window(Some(1), Some(1)), (300, 10));
-        assert_eq!(history_window(Some(999_999), Some(9_999)), (86_400, 900));
-        // 长窗口 + 小步长：步长被放宽到点数上限以内。
-        let (window, step) = history_window(Some(86_400), Some(10));
-        assert!(window / step <= MAX_POINTS, "{window}/{step}");
-    }
-
-    #[test]
-    fn promql_literals_are_escaped() {
-        assert_eq!(escape_promql(r#"a"b\c"#), r#"a\"b\\c"#);
     }
 
     #[test]

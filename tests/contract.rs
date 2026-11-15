@@ -145,37 +145,6 @@ async fn stub_vm_query(Query(params): Query<HashMap<String, String>>) -> axum::J
     axum::Json(json!({ "status": "success", "data": { "resultType": "vector", "result": result } }))
 }
 
-/// VictoriaMetrics 的 `/api/v1/query_range` 桩：四条自观测指标各一串。
-async fn stub_vm_range(Query(params): Query<HashMap<String, String>>) -> axum::Json<Value> {
-    let expr = params.get("query").cloned().unwrap_or_default();
-    // 请求里带了 agent 过滤：BFF 必须把 URL 里的 id 拼进 PromQL。
-    assert!(expr.contains("agent-a"), "{expr}");
-    axum::Json(json!({
-        "status": "success",
-        "data": {
-            "resultType": "matrix",
-            "result": [
-                {
-                    "metric": { "__name__": "agent_cpu_ratio", "agent": "agent-a", "env": "dev" },
-                    "values": [[1_700_000_000, "0.5"], [1_700_000_030, "1.0"]]
-                },
-                {
-                    "metric": { "__name__": "agent_memory_bytes", "agent": "agent-a", "env": "dev" },
-                    "values": [[1_700_000_000, "104857600"], [1_700_000_030, "209715200"]]
-                },
-                {
-                    "metric": { "__name__": "agent_cpu_cores", "agent": "agent-a", "env": "dev" },
-                    "values": [[1_700_000_000, "8"], [1_700_000_030, "8"]]
-                },
-                {
-                    "metric": { "__name__": "agent_admin_latency_seconds", "agent": "agent-a", "env": "dev" },
-                    "values": [[1_700_000_000, "0.015"], [1_700_000_030, "0.25"]]
-                }
-            ]
-        }
-    }))
-}
-
 /// 老一套指标 label：**没有** `tenant_id`。多客户站点能拦不拦就看这条。
 fn vm_labels_without_tenant() -> Vec<String> {
     ["__name__", "agent", "env"]
@@ -222,7 +191,6 @@ async fn spawn_stub_full(healthz_body: Value, vm_labels: Vec<String>) -> String 
         // VictoriaMetrics 的健康端点（console 的 metrics 探活用）。
         .route("/health", get(|| async { "OK" }))
         .route("/api/v1/query", get(stub_vm_query))
-        .route("/api/v1/query_range", get(stub_vm_range))
         // BFF 靠这个端点判断「指标里到底有没有 tenant_id」。
         .route(
             "/api/v1/labels",
@@ -1224,46 +1192,6 @@ async fn metrics_page_reads_the_compute_zone_victoria_metrics() {
 }
 
 #[tokio::test]
-async fn metrics_history_is_normalized_per_agent() {
-    let base = spawn_stub().await;
-    let mut cfg = config(base.clone(), AuthMode::Ingress);
-    cfg.metrics = Some(MetricsConfig {
-        base_url: base.clone(),
-        write_url: None,
-    });
-    let app = api::router(state(cfg));
-
-    let (status, body) = call(
-        &app,
-        Request::builder()
-            .uri("/api/metrics/agents/agent-a/history?window_seconds=900&step_seconds=15")
-            .header("x-console-operator", "zhangsan")
-            .body(Body::empty())
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["agent_id"], "agent-a");
-    assert_eq!(body["window_seconds"], 900);
-    assert_eq!(body["step_seconds"], 15);
-    assert_eq!(body["labels"]["env"], "dev");
-
-    let series = body["series"].as_array().expect("series");
-    assert_eq!(series.len(), 4, "{body}");
-    // 顺序跟常量表（`wist-metrics` 的 `agent::HISTORY`）走：页面横排四张图，顺序要稳定。
-    assert_eq!(series[0]["metric"], "agent_memory_bytes");
-    assert_eq!(series[0]["unit"], "bytes");
-    assert_eq!(series[1]["metric"], "agent_cpu_ratio");
-    assert_eq!(series[1]["unit"], "percent");
-    assert_eq!(series[1]["points"][0][0], 1_700_000_000_000i64);
-    assert_eq!(series[1]["points"][0][1], 50.0);
-    assert_eq!(series[1]["points"][1][1], 100.0);
-    assert_eq!(series[3]["metric"], "agent_admin_latency_seconds");
-    assert_eq!(series[3]["unit"], "milliseconds");
-    assert_eq!(series[3]["points"][1][1], 250.0);
-}
-
-#[tokio::test]
 async fn metrics_without_a_store_is_503_not_an_error_page() {
     let base = spawn_stub().await;
     let app = api::router(state(config(base, AuthMode::Ingress)));
@@ -1567,15 +1495,10 @@ async fn multi_customer_metrics_are_blocked_without_a_tenant_label() {
     });
     let app = api::router(state(cfg));
 
-    // 概览与历史两条读路径都要拦（页面会并发发这两种请求）。
-    for uri in [
-        "/api/metrics?tenant=t-001",
-        "/api/metrics/agents/agent-a/history?tenant=t-001",
-    ] {
-        let (status, body) = call(&app, operator_get(uri)).await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
-        assert_eq!(body["error"]["code"], "metrics_tenant_label_missing");
-    }
+    let uri = "/api/metrics?tenant=t-001";
+    let (status, body) = call(&app, operator_get(uri)).await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{uri}: {body}");
+    assert_eq!(body["error"]["code"], "metrics_tenant_label_missing");
 }
 
 #[tokio::test]
